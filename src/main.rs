@@ -1,4 +1,4 @@
-use std::{cell::RefCell, rc::Rc, sync::Arc};
+use std::sync::Arc;
 
 use winit::{
     application::ApplicationHandler, event::WindowEvent, event_loop::{ActiveEventLoop, ControlFlow, EventLoop}, window::{Window, WindowId}
@@ -32,9 +32,6 @@ pub struct Vertex {
 }
 
 impl Vertex {
-    // const ATTRIBS: [wgpu::VertexAttribute; 2] =
-    //     wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
-
     fn desc() -> wgpu::VertexBufferLayout<'static> {
         wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
@@ -73,9 +70,7 @@ pub trait Layouter {
 
 pub struct RenderContext<'a> {
     pub rect: Rect,
-    pub queue: &'a mut wgpu::Queue,
-    pub vertex_buffer: &'a mut wgpu::Buffer,
-    pub vertex_buffer_data: &'a mut Vec<Vertex>,
+    pub quad_backend: &'a mut QuadBackend,
 }
 
 pub trait Renderer {
@@ -157,15 +152,11 @@ impl Layouter for RowLayouter {
     }
 
     fn position_child(&mut self, size: Size) -> Point {
-        let p = Point {
-            x: self.child_x,
-            y: 0,
-        };
-
-        println!("child_x: {:?}", self.child_x);
         self.child_x += size.width;
-        
-        p
+        Point {
+            x: self.child_x - size.width,
+            y: 0,
+        }
     }
 
     fn compute_size(&mut self, _constraint: LayoutConstraint) -> Size {
@@ -218,101 +209,27 @@ pub struct QuadRenderer {
 
 impl Renderer for QuadRenderer {
     fn render(&mut self, ctx: RenderContext) {
-        let r = ctx.rect;
-
-        let quad_data = vec![
-            Vertex { position: [r.pos.x as f32 / 1000.0, r.pos.y as f32 / 1000.0, 0.0], color: self.color },
-            Vertex { position: [(r.pos.x + r.size.width) as f32 / 1000.0, r.pos.y as f32 / 1000.0, 0.0], color: self.color },
-            Vertex { position: [r.pos.x as f32 / 1000.0, (r.pos.y + r.size.height) as f32 / 1000.0, 0.0], color: self.color },
-            Vertex { position: [(r.pos.x + r.size.width) as f32 / 1000.0, (r.pos.y + r.size.height) as f32 / 1000.0, 0.0], color: self.color },
-        ];
-
-        ctx.vertex_buffer_data.extend(&quad_data);
-
-        dbg!(&ctx.vertex_buffer_data);
-
-        let vertex_buffer_data = bytemuck::cast_slice(&ctx.vertex_buffer_data);
-        ctx.queue.write_buffer(&ctx.vertex_buffer, 0, vertex_buffer_data);
+        ctx.quad_backend.push_quad(ctx.rect, self.color);
     }
 }
 
-pub struct State<'a> {
-    pub surface: wgpu::Surface<'a>,
-    pub device: wgpu::Device,
-    pub queue: wgpu::Queue,
-    pub config: wgpu::SurfaceConfiguration,
-    pub size: winit::dpi::PhysicalSize<u32>,
+pub struct QuadBackend {
     pub render_pipeline: wgpu::RenderPipeline,
     pub vertex_buffer: wgpu::Buffer,
     pub vertex_buffer_data: Vec<Vertex>,
-    pub tree: Tree,
-    pub rects: Vec<Rect>,
-    pub layouters: Vec<Rc<RefCell<dyn Layouter>>>,
-    pub renderers: Vec<Rc<RefCell<dyn Renderer>>>,
 }
 
-impl<'a> State<'a> {
-    pub async fn new(window: Arc<Window>) -> State<'a> {
-        let size = window.inner_size();
-
-        // The instance is a handle to our GPU
-        // Backends::all => Vulkan + Metal + DX12 + Browser WebGPU
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            #[cfg(not(target_arch="wasm32"))]
-            backends: wgpu::Backends::PRIMARY,
-            ..Default::default()
+impl QuadBackend {
+    pub fn new(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> Self {
+        let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Quad Backend Pipeline Layout"),
+            bind_group_layouts: &[],
+            push_constant_ranges: &[],
         });
-        
-        let surface = instance.create_surface(window).unwrap();
-
-        let adapter = instance.request_adapter(
-            &wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::default(),
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-            },
-        ).await.unwrap();
-
-        let (device, queue) = adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                required_features: wgpu::Features::empty(),
-               required_limits: wgpu::Limits::default(),
-                memory_hints: wgpu::MemoryHints::default(),
-                label: None,
-            },
-            None, // Trace path
-        ).await.unwrap();
-
-        let surface_caps = surface.get_capabilities(&adapter);
-        // Shader code in this tutorial assumes an sRGB surface texture. Using a different
-        // one will result in all the colors coming out darker. If you want to support non
-        // sRGB surfaces, you'll need to account for that when drawing to the frame.
-        let surface_format = surface_caps.formats.iter()
-            .find(|f| f.is_srgb())
-            .copied()
-            .unwrap_or(surface_caps.formats[0]);
-        let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: surface_format,
-            width: size.width,
-            height: size.height,
-            present_mode: surface_caps.present_modes[0],
-            alpha_mode: surface_caps.alpha_modes[0],
-            view_formats: vec![],
-            desired_maximum_frame_latency: 2,
-        };
-
-        surface.configure(&device, &config);
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
-        });
-
-        let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Render Pipeline Layout"),
-            bind_group_layouts: &[],
-            push_constant_ranges: &[],
         });
 
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -367,28 +284,129 @@ impl<'a> State<'a> {
 
         let vertex_buffer_data=  Vec::<Vertex>::default();
 
-        let tree = Tree {
-            ids: vec![0, 1, 2],
-            children: vec![vec![1, 2], vec![], vec![]],
+        Self {
+            render_pipeline,
+            vertex_buffer,
+            vertex_buffer_data,
+        }
+    }
+
+    pub fn push_quad(&mut self, r: Rect, color: [f32; 3]) {
+        let quad_data = vec![
+            Vertex { position: [r.pos.x as f32 / 1000.0, r.pos.y as f32 / 1000.0, 0.0], color },
+            Vertex { position: [(r.pos.x + r.size.width) as f32 / 1000.0, r.pos.y as f32 / 1000.0, 0.0], color },
+            Vertex { position: [r.pos.x as f32 / 1000.0, (r.pos.y + r.size.height) as f32 / 1000.0, 0.0], color },
+            Vertex { position: [(r.pos.x + r.size.width) as f32 / 1000.0, (r.pos.y + r.size.height) as f32 / 1000.0, 0.0], color },
+        ];
+
+        self.vertex_buffer_data.extend(&quad_data);
+    }
+
+    pub fn clear(&mut self) {
+        self.vertex_buffer_data.clear();
+    }
+
+    pub fn render(&mut self, encoder: &mut wgpu::CommandEncoder, queue: &wgpu::Queue, view: &wgpu::TextureView) {
+            let vertex_buffer_data = bytemuck::cast_slice(&self.vertex_buffer_data);
+            queue.write_buffer(&self.vertex_buffer, 0, vertex_buffer_data);
+                let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Render Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.1,
+                                g: 0.2,
+                                b: 0.3,
+                                a: 1.0,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    occlusion_query_set: None,
+                    timestamp_writes: None,
+                });
+
+            render_pass.set_pipeline(&self.render_pipeline);
+            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            render_pass.draw(0..self.vertex_buffer_data.len() as u32, 0..1);
+    }
+}
+
+pub struct State<'a> {
+    pub surface: wgpu::Surface<'a>,
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
+    pub config: wgpu::SurfaceConfiguration,
+    pub size: winit::dpi::PhysicalSize<u32>,
+    pub tree: Tree,
+    pub rects: Vec<Rect>,
+    pub layouters: Vec<Box<dyn Layouter>>,
+    pub renderers: Vec<Box<dyn Renderer>>,
+    pub quad_backend: QuadBackend,
+}
+
+impl<'a> State<'a> {
+    pub async fn new(window: Arc<Window>) -> State<'a> {
+        let size = window.inner_size();
+
+        // The instance is a handle to our GPU
+        // Backends::all => Vulkan + Metal + DX12 + Browser WebGPU
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            #[cfg(not(target_arch="wasm32"))]
+            backends: wgpu::Backends::PRIMARY,
+            ..Default::default()
+        });
+        
+        let surface = instance.create_surface(window).unwrap();
+
+        let adapter = instance.request_adapter(
+            &wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::default(),
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: false,
+            },
+        ).await.unwrap();
+
+        let (device, queue) = adapter.request_device(
+            &wgpu::DeviceDescriptor {
+                required_features: wgpu::Features::empty(),
+               required_limits: wgpu::Limits::default(),
+                memory_hints: wgpu::MemoryHints::default(),
+                label: None,
+            },
+            None, // Trace path
+        ).await.unwrap();
+
+        let surface_caps = surface.get_capabilities(&adapter);
+        // Shader code in this tutorial assumes an sRGB surface texture. Using a different
+        // one will result in all the colors coming out darker. If you want to support non
+        // sRGB surfaces, you'll need to account for that when drawing to the frame.
+        let surface_format = surface_caps.formats.iter()
+            .find(|f| f.is_srgb())
+            .copied()
+            .unwrap_or(surface_caps.formats[0]);
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: surface_format,
+            width: size.width,
+            height: size.height,
+            present_mode: surface_caps.present_modes[0],
+            alpha_mode: surface_caps.alpha_modes[0],
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
         };
 
-        let rects = vec![
-            Rect { pos: Point { x: 0, y: 0 }, size: Size { width: 0, height: 0 } },
-            Rect { pos: Point { x: 0, y: 0 }, size: Size { width: 0, height: 0 } },
-            Rect { pos: Point { x: 0, y: 0 }, size: Size { width: 0, height: 0 } },
-        ];
+        let quad_backend = QuadBackend::new(&device, &config);
 
-        let layouters: Vec<Rc<RefCell<dyn Layouter>>> = vec![
-            Rc::new(RefCell::new(RowLayouter::default())),
-            Rc::new(RefCell::new(SizedBoxLayouter::new(50, 50))),
-            Rc::new(RefCell::new(SizedBoxLayouter::new(20, 50))),
-        ];
+        surface.configure(&device, &config);
 
-        let renderers: Vec<Rc<RefCell<dyn Renderer>>> = vec![
-            Rc::new(RefCell::new(DefaultRenderer {})),
-            Rc::new(RefCell::new(QuadRenderer { color: [0.0, 0.5, 0.4] })),
-            Rc::new(RefCell::new(QuadRenderer { color: [0.8, 0.3, 0.0] })),
-        ];
+        let tree = Tree {
+            ids: Vec::new(),
+            children: Vec::new(),
+        };
 
         Self {
             surface,
@@ -396,14 +414,25 @@ impl<'a> State<'a> {
             queue,
             config,
             size,
-            render_pipeline,
-            vertex_buffer,
-            vertex_buffer_data,
             tree,
-            rects,
-            layouters,
-            renderers,
+            rects: Vec::new(),
+            layouters: Vec::new(),
+            renderers: Vec::new(),
+            quad_backend,
         }
+    }
+
+    fn push_widget<L, R>(&mut self, layouter: L, renderer: R) -> usize where L: Layouter + 'static, R: Renderer + 'static {
+        let id = self.tree.ids.len();
+
+        self.tree.ids.push(id);
+        self.tree.children.push(vec![]);
+        self.rects.push(Rect { pos: Point { x: 0, y: 0 }, size: Size { width: 0, height: 0 } });
+
+        self.layouters.push(Box::new(layouter));
+        self.renderers.push(Box::new(renderer));
+
+        id
     }
 
     pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
@@ -424,7 +453,7 @@ impl<'a> State<'a> {
         };
 
         for layouter in self.layouters.iter_mut() {
-            layouter.borrow_mut().prepare();
+            layouter.prepare();
         }
 
         // Hardcode root rect to full window size
@@ -435,25 +464,24 @@ impl<'a> State<'a> {
 
         // todo(chad): make this fully recursive
         for child_id in self.tree.children[root].clone() {
-            let child_constraint = self.layouters[root].borrow_mut().constrain_child(constraint);
-            self.rects[child_id].size = self.layouters[child_id].borrow_mut().compute_size(child_constraint);
-            self.layouters[root].borrow_mut().child_sized(self.rects[child_id].size);
+            let child_constraint = self.layouters[root].constrain_child(constraint);
+            self.rects[child_id].size = self.layouters[child_id].compute_size(child_constraint);
+            self.layouters[root].child_sized(self.rects[child_id].size);
         }
         for child_id in self.tree.children[root].clone() {
-            self.rects[child_id].pos = self.layouters[root].borrow_mut().position_child(self.rects[child_id].size);
+            self.rects[child_id].pos = self.layouters[root].position_child(self.rects[child_id].size);
         }
 
-        self.rects[root].size =  self.layouters[root as usize].clone().borrow_mut().compute_size(constraint);
+        self.rects[root].size =  self.layouters[root as usize].compute_size(constraint);
     }
 
     pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
-        self.vertex_buffer_data.clear();
+        self.quad_backend.clear();
+        
         for (idx, renderer) in self.renderers.iter_mut().enumerate() {
-            renderer.borrow_mut().render(RenderContext {
+            renderer.render(RenderContext {
                 rect: self.rects[idx],
-                queue: &mut self.queue,
-                vertex_buffer: &mut self.vertex_buffer,
-                vertex_buffer_data: &mut self.vertex_buffer_data,
+                quad_backend: &mut self.quad_backend,
             });
         }
 
@@ -463,32 +491,8 @@ impl<'a> State<'a> {
             label: Some("Render Encoder"),
         });
 
-        {
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Render Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.1,
-                            g: 0.2,
-                            b: 0.3,
-                            a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                occlusion_query_set: None,
-                timestamp_writes: None,
-            });
-
-            render_pass.set_pipeline(&self.render_pipeline);
-            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            render_pass.draw(0..self.vertex_buffer_data.len() as u32, 0..1);
-        }
-    
+        self.quad_backend.render(&mut encoder, &self.queue, &view);
+ 
         // submit will accept anything that implements IntoIter
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
@@ -509,7 +513,13 @@ impl<'a> ApplicationHandler for App<'a> {
 
         let window = event_loop.create_window(Window::default_attributes()).unwrap();
         let window = Arc::new(window);
-        let state = pollster::block_on(State::new(Arc::clone(&window)));
+        let mut state = pollster::block_on(State::new(Arc::clone(&window)));
+
+        let _root = state.push_widget(RowLayouter::default(), DefaultRenderer {});
+        let c1 = state.push_widget(SizedBoxLayouter::new(50, 50), QuadRenderer { color: [0.0, 0.5, 0.4] });
+        let c2 = state.push_widget(SizedBoxLayouter::new(20, 50), QuadRenderer { color: [0.8, 0.3, 0.0] });
+
+        state.tree.children[0].append(&mut vec![c1, c2]);
 
         self.window = Some(window);
         self.state = Some(state);

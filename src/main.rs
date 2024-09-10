@@ -3,9 +3,7 @@ pub mod layout;
 pub mod quad_backend;
 pub mod render;
 
-use std::cell::RefCell;
-use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use floem_reactive::{create_effect, create_rw_signal, RwSignal};
 use winit::event::ElementState;
@@ -56,7 +54,7 @@ pub struct State<'a> {
     pub children: Vec<Vec<usize>>,
     pub rects: Vec<Rect>,
     pub layouters: Vec<Box<dyn Layouter>>,
-    pub renderers: Vec<Rc<RefCell<dyn Renderer>>>,
+    pub renderers: Vec<Arc<Mutex<dyn Renderer>>>,
     pub quad_backend: QuadBackend,
     pub needs_render: RwSignal<Vec<usize>>,
 }
@@ -157,14 +155,14 @@ impl<'a> State<'a> {
 
         self.layouters.push(Box::new(layouter));
 
-        let renderer = Rc::new(RefCell::new(renderer));
+        let renderer = Arc::new(Mutex::new(renderer));
         self.renderers.push(renderer.clone());
 
         let renderer = renderer.clone();
         let needs_render = self.needs_render.clone();
         create_effect(move |_| {
             println!("Effect - rendering {}", id);
-            renderer.borrow_mut().render(&mut DummyRenderContext {});
+            renderer.lock().unwrap().render(&mut DummyRenderContext {});
             needs_render.update(|n| n.push(id));
         });
 
@@ -234,7 +232,7 @@ impl<'a> State<'a> {
         self.quad_backend.clear();
 
         for (idx, renderer) in self.renderers.iter_mut().enumerate() {
-            renderer.borrow_mut().render(&mut DefaultRenderContext {
+            renderer.lock().unwrap().render(&mut DefaultRenderContext {
                 rect: self.rects[idx],
                 quad_backend: &mut self.quad_backend,
             });

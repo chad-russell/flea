@@ -427,9 +427,19 @@ name = "flea"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "floem_reactive",
  "pollster",
  "wgpu",
  "winit",
+]
+
+[[package]]
+name = "floem_reactive"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "498b1e253298c1e40f8767cdcca9fa7df1fc053ab5fdc163f8d8487da3225d54"
+dependencies = [
+ "smallvec",
 ]
 
 [[package]]

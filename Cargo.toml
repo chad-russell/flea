@@ -8,3 +8,4 @@ bytemuck = { version = "1.17.1", features = ["derive"] }
 pollster = "0.3.0"
 wgpu = "22.1.0"
 winit = "0.30.5"
+floem_reactive = "0.1.0"

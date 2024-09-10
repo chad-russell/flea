@@ -19,7 +19,7 @@ use winit::{
 use geometry::{Point, Rect, Size};
 use layout::{LayoutConstraint, Layouter, PaddedLayouter, RowLayouter, SizedBoxLayouter};
 use quad_backend::QuadBackend;
-use render::{DefaultRenderer, QuadRenderer, RenderContext, Renderer};
+use render::{DefaultRenderContext, DefaultRenderer, DummyRenderContext, QuadRenderer, Renderer};
 
 fn main() {
     pollster::block_on(run());
@@ -41,7 +41,7 @@ async fn run() {
         state: None,
         window: None,
         keydown_callbacks: Default::default(),
-        needs_render: create_rw_signal(Vec::new()),
+        color: create_rw_signal([0.0, 0.5, 0.4]),
     };
     event_loop.run_app(&mut app).unwrap();
 }
@@ -56,8 +56,9 @@ pub struct State<'a> {
     pub children: Vec<Vec<usize>>,
     pub rects: Vec<Rect>,
     pub layouters: Vec<Box<dyn Layouter>>,
-    pub renderers: Vec<Box<dyn Renderer>>,
+    pub renderers: Vec<Rc<RefCell<dyn Renderer>>>,
     pub quad_backend: QuadBackend,
+    pub needs_render: RwSignal<Vec<usize>>,
 }
 
 impl<'a> State<'a> {
@@ -133,6 +134,7 @@ impl<'a> State<'a> {
             layouters: Vec::new(),
             renderers: Vec::new(),
             quad_backend,
+            needs_render: create_rw_signal(Vec::new()),
         }
     }
 
@@ -154,7 +156,17 @@ impl<'a> State<'a> {
         });
 
         self.layouters.push(Box::new(layouter));
-        self.renderers.push(Box::new(renderer));
+
+        let renderer = Rc::new(RefCell::new(renderer));
+        self.renderers.push(renderer.clone());
+
+        let renderer = renderer.clone();
+        let needs_render = self.needs_render.clone();
+        create_effect(move |_| {
+            println!("Effect - rendering {}", id);
+            renderer.borrow_mut().render(&mut DummyRenderContext {});
+            needs_render.update(|n| n.push(id));
+        });
 
         id
     }
@@ -222,7 +234,7 @@ impl<'a> State<'a> {
         self.quad_backend.clear();
 
         for (idx, renderer) in self.renderers.iter_mut().enumerate() {
-            renderer.render(RenderContext {
+            renderer.borrow_mut().render(&mut DefaultRenderContext {
                 rect: self.rects[idx],
                 quad_backend: &mut self.quad_backend,
             });
@@ -249,21 +261,15 @@ impl<'a> State<'a> {
 }
 
 struct App<'a> {
-    state: Option<Rc<RefCell<State<'a>>>>,
+    state: Option<State<'a>>,
     window: Option<Arc<Window>>,
     keydown_callbacks: Vec<Box<dyn Fn() + 'static>>,
-    needs_render: RwSignal<Vec<usize>>,
+    color: RwSignal<[f32; 3]>,
 }
 
 impl<'a> App<'a> {
-    fn on_keydown(&mut self, id: usize, callback: impl Fn() + 'static) {
-        let needs_render = self.needs_render.clone();
-
-        self.keydown_callbacks.push(Box::new(move || {
-            println!("{} needs render!", id);
-            needs_render.update(|n| n.push(id));
-            callback();
-        }));
+    fn on_keydown(&mut self, callback: impl Fn() + 'static) {
+        self.keydown_callbacks.push(Box::new(callback));
     }
 }
 
@@ -275,20 +281,21 @@ impl<'a> ApplicationHandler for App<'a> {
         let window = Arc::new(window);
         let mut state = pollster::block_on(State::new(Arc::clone(&window)));
 
-        let color = create_rw_signal([0.0, 0.5, 0.4]);
+        self.color = create_rw_signal([0.0, 0.5, 0.4]);
 
         let root = state.push_widget(PaddedLayouter::new(100, 100, 100, 100), DefaultRenderer {});
         let row = state.push_widget(RowLayouter::default(), DefaultRenderer {});
         let c1 = state.push_widget(
             SizedBoxLayouter::new(Size { width: 200, height: 200 }),
             QuadRenderer {
-                color
+                color: self.color
             },
         );
         // let c2 = state.push_widget(SizedBoxLayouter::new(20, 50), QuadRenderer { color: [0.8, 0.3, 0.0] });
 
-        self.on_keydown(c1, move || {
-            color.set([0.6, 0.3, 0.0]);
+        let color = self.color.clone();
+        self.on_keydown(move || {
+            color.set([0.6, 0.0, 0.0]);
         });
 
         state.children[root].push(row);
@@ -296,36 +303,42 @@ impl<'a> ApplicationHandler for App<'a> {
         state.children[row].append(&mut vec![c1]);
 
         self.window = Some(window);
-        self.state = Some(Rc::new(RefCell::new(state)));
+        self.state = Some(state);
 
-        let needs_render = self.needs_render.clone();
-        let state = self.state.as_mut().unwrap().clone();
+        self.state.as_mut().unwrap().render().unwrap();
+        self.window.as_ref().unwrap().request_redraw();
+
+        let needs_render = self.state.as_ref().unwrap().needs_render.clone();
+        let window = self.window.as_ref().unwrap().clone();
         create_effect(move |_| {
-            let needs_render = needs_render.get();
-            println!("needs render: {:?}", needs_render);
-            for id in needs_render {
-                // self.state.as_mut().unwrap().borrow_mut().render().unwrap();
-            }
+            needs_render.get();
+            window.request_redraw();
         });
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        self.state.as_mut().unwrap().borrow_mut().render().unwrap();
-        self.window.as_ref().unwrap().request_redraw();
-
         match event {
             WindowEvent::CloseRequested => {
                 event_loop.exit();
             }
             WindowEvent::RedrawRequested => {
-                self.state.as_mut().unwrap().borrow_mut().render().unwrap();
-                self.window.as_ref().unwrap().request_redraw();
+                for id in self.state.as_ref().unwrap().needs_render.get() {
+                    println!("Rendering {}", id);
+                }
+
+                if !self.state.as_ref().unwrap().needs_render.get().is_empty() {
+                    self.state.as_mut().unwrap().render().unwrap();
+                }
+
+                self.state.as_mut().unwrap().needs_render.set(Vec::new());
             }
             WindowEvent::Resized(new_size) => {
-                self.state.as_mut().unwrap().borrow_mut().resize(new_size);
-                self.state.as_mut().unwrap().borrow_mut().layout_root();
+                self.state.as_mut().unwrap().resize(new_size);
+                self.state.as_mut().unwrap().layout_root();
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                // self.color.set([0.8, 0.1, 0.0]);
+
                 for keydown in self.keydown_callbacks.iter() {
                     keydown();
                 }

@@ -108,20 +108,18 @@ impl QuadBackend {
         }
     }
 
-    pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
-        self.win_size = new_size;
-    }
-
     pub fn clear(&mut self) {
         self.vertex_buffer_data.clear();
     }
 
     pub fn push_quad(&mut self, r: Rect, color: [f32; 3]) {
+        let size = self.win_size;
+
         let quad_data = vec![
-            Vertex { position: to_screen_pos(r.pos, self.win_size), color },
-            Vertex { position: to_screen_pos(Point { x: r.pos.x + r.size.width, y: r.pos.y }, self.win_size), color },
-            Vertex { position: to_screen_pos(Point { x: r.pos.x, y: r.pos.y + r.size.height }, self.win_size), color },
-            Vertex { position: to_screen_pos(Point { x: r.pos.x + r.size.width, y: r.pos.y + r.size.height }, self.win_size), color },
+            Vertex { position: to_screen_pos(r.pos, size), color },
+            Vertex { position: to_screen_pos(Point { x: r.pos.x + r.size.width, y: r.pos.y }, size), color },
+            Vertex { position: to_screen_pos(Point { x: r.pos.x, y: r.pos.y + r.size.height }, size), color },
+            Vertex { position: to_screen_pos(Point { x: r.pos.x + r.size.width, y: r.pos.y + r.size.height }, size), color },
         ];
 
         self.vertex_buffer_data.extend(&quad_data);

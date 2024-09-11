@@ -11,10 +11,6 @@ impl<'a> RenderContext<'a> {
     fn push_quad(&mut self, r: Rect, color: [f32; 3]) {
         self.quad_backend.push_quad(r, color);
     }
-
-    fn rect(&self) -> Rect {
-        self.rect
-    }
 }
 
 pub trait Renderer {
@@ -33,6 +29,6 @@ pub struct QuadRenderer {
 
 impl Renderer for QuadRenderer {
     fn render(&mut self, ctx: &mut RenderContext) {
-        ctx.push_quad(ctx.rect(), self.color.get());
+        ctx.push_quad(ctx.rect, self.color.get());
     }
 }

@@ -3,7 +3,7 @@ pub mod layout;
 pub mod quad_backend;
 pub mod render;
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use floem_reactive::{create_effect, create_rw_signal, RwSignal};
 use winit::event::ElementState;
@@ -41,13 +41,14 @@ pub struct State {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub config: wgpu::SurfaceConfiguration,
-    pub win_size: winit::dpi::PhysicalSize<u32>,
+    pub win_size: RwSignal<winit::dpi::PhysicalSize<u32>>,
     pub widgets: Vec<usize>,
     pub children: Vec<Vec<usize>>,
     pub rects: Vec<Rect>,
-    pub layouters: Vec<Box<dyn Layouter>>,
+    pub layouters: Vec<Arc<Mutex<dyn Layouter>>>,
     pub renderers: Vec<Arc<Mutex<dyn Renderer>>>,
     pub quad_backend: QuadBackend,
+    pub needs_layout: RwSignal<Vec<usize>>,
     pub needs_render: RwSignal<Vec<usize>>,
 }
 
@@ -55,8 +56,6 @@ impl State {
     pub async fn new(window: Arc<Window>) -> State {
         let size = window.inner_size();
 
-        // The instance is a handle to our GPU
-        // Backends::all => Vulkan + Metal + DX12 + Browser WebGPU
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             #[cfg(not(target_arch = "wasm32"))]
             backends: wgpu::Backends::PRIMARY,
@@ -89,9 +88,6 @@ impl State {
 
         let surface_caps = surface.get_capabilities(&adapter);
 
-        // Shader code in this tutorial assumes an sRGB surface texture. Using a different
-        // one will result in all the colors coming out darker. If you want to support non
-        // sRGB surfaces, you'll need to account for that when drawing to the frame.
         let surface_format = surface_caps
             .formats
             .iter()
@@ -109,7 +105,9 @@ impl State {
             desired_maximum_frame_latency: 2,
         };
 
-        let quad_backend = QuadBackend::new(&device, &config, size);
+        let size = create_rw_signal(size);
+
+        let quad_backend = QuadBackend::new(&device, &config, size.get());
 
         surface.configure(&device, &config);
 
@@ -125,11 +123,12 @@ impl State {
             layouters: Vec::new(),
             renderers: Vec::new(),
             quad_backend,
+            needs_layout: create_rw_signal(Vec::new()),
             needs_render: create_rw_signal(Vec::new()),
         }
     }
 
-    fn push_widget<L, R>(&mut self, layouter: L, renderer: Arc<Mutex<R>>) -> usize
+    fn push_widget<L, R>(&mut self, layouter: Arc<Mutex<L>>, renderer: Arc<Mutex<R>>) -> usize
     where
         L: Layouter + 'static,
         R: Renderer + 'static,
@@ -146,60 +145,55 @@ impl State {
             },
         });
 
-        self.layouters.push(Box::new(layouter));
+        self.layouters.push(layouter);
         self.renderers.push(renderer);
 
         id
     }
 
-    pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
-        self.quad_backend.resize(new_size);
+    pub fn resize(&mut self) {
+        let new_size = self.win_size.get();
 
         if new_size.width > 0 && new_size.height > 0 {
-            self.win_size = new_size;
             self.config.width = new_size.width;
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
         }
 
-        for layouter in self.layouters.iter_mut() {
-            layouter.prepare();
-        }
-
-        // Hardcode root rect to full window size
         self.rects[0] = Rect {
             pos: Point { x: 0, y: 0 },
             size: Size {
-                width: self.win_size.width,
-                height: self.win_size.height,
+                width: self.win_size.get().width,
+                height: self.win_size.get().height,
             },
         };
     }
 
     pub fn layout_root(&mut self) {
-        for layouter in self.layouters.iter_mut() {
-            layouter.prepare();
-        }
-
         let constraint = LayoutConstraint {
-            min_width: self.win_size.width,
-            min_height: self.win_size.height,
-            max_width: self.win_size.width,
-            max_height: self.win_size.height,
+            min_width: self.win_size.get().width,
+            min_height: self.win_size.get().height,
+            max_width: self.win_size.get().width,
+            max_height: self.win_size.get().height,
         };
 
         self.layout_id(0, constraint);
     }
 
     pub fn layout_id(&mut self, id: usize, constraint: LayoutConstraint) {
+        let layouter = self.layouters[id].clone();
+        let mut layouter = layouter.lock().unwrap();
+
+        layouter.prepare();
+
         for child_id in self.children[id].clone() {
-            let child_constraint = self.layouters[id].constrain_child(constraint);
+            let child_constraint = layouter.constrain_child(constraint);
             self.layout_id(child_id, child_constraint);
-            self.layouters[id].child_sized(self.rects[child_id].size);
+            layouter.child_sized(self.rects[child_id].size);
         }
 
         for child_id in self.children[id].clone() {
-            let child_offset = self.layouters[id].position_child(self.rects[child_id].size);
+            let child_offset = layouter.position_child(self.rects[child_id].size);
             let base_pos = self.rects[id].pos;
 
             self.rects[child_id].pos = Point {
@@ -208,7 +202,7 @@ impl State {
             }
         }
 
-        self.rects[id].size = self.layouters[id].compute_size(constraint);
+        self.rects[id].size = layouter.compute_size(constraint);
     }
 
     pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
@@ -335,6 +329,12 @@ where
     }
 }
 
+impl<L, R> Into<WidgetTreeBuilder<L, R>> for WidgetBuilder<L, R> where L: Layouter + 'static, R: Renderer + 'static {
+    fn into(self) -> WidgetTreeBuilder<L, R> {
+        WidgetTreeBuilder::with_root(self)
+    }
+}
+
 pub struct WidgetTreeBuilder<L, R>
 where
     L: Layouter + 'static,
@@ -376,12 +376,12 @@ where
         }
     }
 
-    pub fn child<LL, RR>(mut self, child: WidgetTreeBuilder<LL, RR>) -> Self
+    pub fn child<LL, RR>(mut self, child: impl Into<WidgetTreeBuilder<LL, RR>> + 'static) -> Self
     where
         LL: Layouter + 'static,
         RR: Renderer + 'static,
     {
-        self.children.push(Box::new(move |app| child.build(app)));
+        self.children.push(Box::new(move |app| child.into().build(app)));
         self
     }
 
@@ -410,29 +410,47 @@ impl App {
         self.keydown_callbacks.push(Box::new(callback));
     }
 
+    pub fn state(&self) -> MutexGuard<'_, State> {
+        self.state.as_ref().unwrap().lock().unwrap()
+    }
+
     pub fn push_widget<L, R>(&mut self, widget: Widget<L, R>) -> usize
     where
         L: Layouter + 'static,
         R: Renderer + 'static,
     {
+        let layouter = Arc::new(Mutex::new(widget.layouter));
         let renderer = Arc::new(Mutex::new(widget.renderer));
 
         let id = self
-            .state
-            .as_ref()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .push_widget(widget.layouter, renderer.clone());
+            .state()
+            .push_widget(layouter.clone(), renderer.clone());
 
-        let state = self.state.as_ref().unwrap().clone();
+        // let state = self.state.clone();
+    //     create_effect(move |_| {
+    //         println!("Effect - layout {}", id);
+
+    //         let mut state = state.lock().unwrap();
+
+    //         layouter.lock().unwrap().prepare();
+    // // fn prepare(&mut self) {}
+    // // fn constrain_child(&mut self, constraint: LayoutConstraint) -> LayoutConstraint;
+    // // fn child_sized(&mut self, _size: Size) {}
+    // // fn position_child(&mut self, size: Size) -> Point;
+    // // fn compute_size(&mut self, constraint: LayoutConstraint) -> Size;
+    //     });
+
+        let state = self.state.clone().unwrap();
         create_effect(move |_| {
             println!("Effect - rendering {}", id);
+
             let mut state = state.lock().unwrap();
+
             renderer.lock().unwrap().render(&mut RenderContext {
                 rect: state.rects[id],
                 quad_backend: &mut state.quad_backend,
             });
+
             state.needs_render.update(|n| n.push(id));
         });
 
@@ -460,56 +478,57 @@ impl App {
             }
         });
 
-        WidgetTreeBuilder::with_root(
-            WidgetBuilder::from_layouter(PaddedLayouter::new(100, 100, 100, 100)),
-        )
-        .child(
+        let row_of_boxes = 
             WidgetTreeBuilder::with_root(
                 WidgetBuilder::from_layouter(RowLayouter::default()),
             )
-            .child(WidgetTreeBuilder::with_root(
+            .child(
                 WidgetBuilder::new()
                     .with_layouter(SizedBoxLayouter::new(Size {
                         width: 200,
                         height: 200,
                     }))
                     .with_renderer(QuadRenderer { color: c1 }),
-            ))
+            )
             .child(
                 // child 2
-                WidgetTreeBuilder::with_root(
-                    WidgetBuilder::new()
-                        .with_layouter(SizedBoxLayouter::new(Size {
-                            width: 200,
-                            height: 200,
-                        }))
-                        .with_renderer(QuadRenderer { color: c2 }),
-                ),
-            ),
+                WidgetBuilder::new()
+                    .with_layouter(SizedBoxLayouter::new(Size {
+                        width: 200,
+                        height: 200,
+                    }))
+                    .with_renderer(QuadRenderer { color: c2 }),
+            );
+
+        WidgetTreeBuilder::with_root(
+            WidgetBuilder::from_layouter(PaddedLayouter::new(100, 100, 100, 100)),
         )
+        .child(row_of_boxes)
         .build(self);
 
-        // let root_widget = WidgetBuilder::new().with_layouter(PaddedLayouter::new(100, 100, 100, 100)).build();
-        // let root = self.push_widget(root_widget);
+        // {
+        //     let root_widget = WidgetBuilder::new().with_layouter(PaddedLayouter::new(100, 100, 100, 100)).build();
+        //     let root = self.push_widget(root_widget);
 
-        // let row = self.push_widget(WidgetBuilder::new().with_layouter(RowLayouter::default()).build());
-        // self.push_child(root, row);
+        //     let row = self.push_widget(WidgetBuilder::new().with_layouter(RowLayouter::default()).build());
+        //     self.push_child(root, row);
 
-        // let c1 = self.push_widget(
-        //     WidgetBuilder::new().with_layouter(SizedBoxLayouter::new(Size {
-        //         width: 200,
-        //         height: 200,
-        //     })).with_renderer(
-        //     QuadRenderer { color: c1 }).build(),
-        // );
-        // let c2 = self.push_widget(
-        //     WidgetBuilder::new().with_layouter(SizedBoxLayouter::new(Size {
-        //         width: 200,
-        //         height: 200,
-        //     })).with_renderer(
-        //     QuadRenderer { color: c2 }).build(),
-        // );
-        // self.push_children(row, &[c1, c2]);
+        //     let c1 = self.push_widget(
+        //         WidgetBuilder::new().with_layouter(SizedBoxLayouter::new(Size {
+        //             width: 200,
+        //             height: 200,
+        //         })).with_renderer(
+        //         QuadRenderer { color: c1 }).build(),
+        //     );
+        //     let c2 = self.push_widget(
+        //         WidgetBuilder::new().with_layouter(SizedBoxLayouter::new(Size {
+        //             width: 200,
+        //             height: 200,
+        //         })).with_renderer(
+        //         QuadRenderer { color: c2 }).build(),
+        //     );
+        //     self.push_children(row, &[c1, c2]);
+        // }
     }
 }
 
@@ -529,17 +548,17 @@ impl ApplicationHandler for App {
 
         self.setup();
 
-        let needs_render = self
-            .state
-            .as_ref()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .needs_render
-            .clone();
+        let win_size = self.state().win_size.clone();
+        let needs_layout = self.state().needs_layout.clone();
+        let needs_render = self.state().needs_render.clone();
+        create_effect(move |_| {
+            win_size.get();
+            needs_layout.update(|n| n.push(0));
+            needs_render.update(|n| n.push(0));
+        });
 
+        let needs_render = self.state().needs_render.clone();
         let window = self.window.as_ref().unwrap().clone();
-
         create_effect(move |_| {
             needs_render.get();
             window.request_redraw();
@@ -547,71 +566,31 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        if !self.state().needs_layout.get().is_empty() {
+            self.state().layout_root();
+            self.state().needs_layout.update(|n| n.clear());
+        }
+
         match event {
             WindowEvent::CloseRequested => {
                 event_loop.exit();
             }
             WindowEvent::RedrawRequested => {
-                for id in self
-                    .state
-                    .as_ref()
-                    .unwrap()
-                    .lock()
-                    .unwrap()
-                    .needs_render
-                    .get()
+                for id in self.state().needs_render.get()
                 {
-                    println!("Rendering {}", id);
+                    println!("Draw - Rendering {}", id);
                 }
 
-                if !self
-                    .state
-                    .as_ref()
-                    .unwrap()
-                    .lock()
-                    .unwrap()
-                    .needs_render
-                    .get()
-                    .is_empty()
+                if !self.state().needs_render.get().is_empty()
                 {
-                    self.state
-                        .as_mut()
-                        .unwrap()
-                        .lock()
-                        .unwrap()
-                        .render()
-                        .unwrap();
+                    self.state().render().unwrap();
+                    self.state().needs_render.update(|n| n.clear());
                 }
-
-                self.state
-                    .as_mut()
-                    .unwrap()
-                    .lock()
-                    .unwrap()
-                    .needs_render
-                    .update(|n| n.clear());
             }
             WindowEvent::Resized(new_size) => {
-                self.state
-                    .as_mut()
-                    .unwrap()
-                    .lock()
-                    .unwrap()
-                    .resize(new_size);
-
-                self.state.as_mut().unwrap().lock().unwrap().layout_root();
-
-                self.state
-                    .as_mut()
-                    .unwrap()
-                    .lock()
-                    .unwrap()
-                    .render()
-                    .unwrap();
+                self.state().win_size.set(new_size);
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
-                // self.color.set([0.8, 0.1, 0.0]);
-
                 for keydown in self.keydown_callbacks.iter() {
                     keydown();
                 }

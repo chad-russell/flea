@@ -86,6 +86,7 @@ impl State {
             .unwrap();
 
         let surface_caps = surface.get_capabilities(&adapter);
+
         // Shader code in this tutorial assumes an sRGB surface texture. Using a different
         // one will result in all the colors coming out darker. If you want to support non
         // sRGB surfaces, you'll need to account for that when drawing to the frame.
@@ -273,6 +274,50 @@ impl<L, R> WidgetBuilder<L, R> where L: Layouter, R: Renderer {
     }
 }
 
+impl<L, R> Into<Widget<L, R>> for WidgetBuilder<L, R> where L: Layouter + 'static, R: Renderer + 'static {
+    fn into(self) -> Widget<L, R> {
+        self.build()
+    }
+}
+
+struct WidgetTreeBuilder<L, R> where L: Layouter + 'static, R: Renderer + 'static {
+    widget: Widget<L, R>,
+    children: Vec<Box<dyn FnOnce(&mut App) -> usize>>,
+}
+
+impl WidgetTreeBuilder<DefaultLayouter, DefaultRenderer> {
+    fn new() -> WidgetTreeBuilder<DefaultLayouter, DefaultRenderer> {
+        WidgetTreeBuilder { widget: Widget::new(DefaultLayouter{}, DefaultRenderer{}), children: Vec::new() }
+    }
+}
+
+impl<L, R> WidgetTreeBuilder<L, R> where L: Layouter + 'static, R: Renderer + 'static {
+    fn with_widget<LL, RR>(self, widget: Widget<LL, RR>) -> WidgetTreeBuilder<LL, RR>
+    where
+        LL: Layouter + 'static,
+        RR: Renderer + 'static, {
+            WidgetTreeBuilder { widget, children: self.children }
+        }
+
+    fn child<LL, RR>(mut self, child: WidgetTreeBuilder<LL, RR>) -> Self 
+    where
+        LL: Layouter + 'static,
+        RR: Renderer + 'static
+    {
+        self.children.push(Box::new(move |app| child.build(app)));
+        self
+    }
+
+    fn build(self, app: &mut App) -> usize {
+        let id = app.push_widget(self.widget);
+
+        let child_ids = self.children.into_iter().map(|child| child(app)).collect::<Vec<_>>();
+        app.push_children(id, &child_ids);
+
+        id
+    }
+}
+
 struct App {
     state: Option<Arc<Mutex<State>>>,
     window: Option<Arc<Window>>,
@@ -334,27 +379,53 @@ impl App {
             }
         });
 
-        let root_widget = WidgetBuilder::new().with_layouter(PaddedLayouter::new(100, 100, 100, 100)).build();
-        let root = self.push_widget(root_widget);
+        WidgetTreeBuilder::new()
+            .with_widget(WidgetBuilder::new().with_layouter(PaddedLayouter::new(100, 100, 100, 100)).build())
+            .child(WidgetTreeBuilder::new()
+                .with_widget(WidgetBuilder::new().with_layouter(RowLayouter::default()).build())
+                .child(
+                    WidgetTreeBuilder::new().with_widget(
+                        WidgetBuilder::new().with_layouter(SizedBoxLayouter::new(Size {
+                            width: 200,
+                            height: 200,
+                        })).with_renderer(
+                        QuadRenderer { color: c1 })
+                        .build(),
+                    )
+                ).child(
+                    // child 2
+                    WidgetTreeBuilder::new().with_widget(
+                        WidgetBuilder::new().with_layouter(SizedBoxLayouter::new(Size {
+                            width: 200,
+                            height: 200,
+                        })).with_renderer(
+                        QuadRenderer { color: c2 })
+                        .build(),
+                    ),
+                ))
+            .build(self);
 
-        let row = self.push_widget(WidgetBuilder::new().with_layouter(RowLayouter::default()).build());
-        self.push_child(root, row);
+        // let root_widget = WidgetBuilder::new().with_layouter(PaddedLayouter::new(100, 100, 100, 100)).build();
+        // let root = self.push_widget(root_widget);
 
-        let c1 = self.push_widget(
-            WidgetBuilder::new().with_layouter(SizedBoxLayouter::new(Size {
-                width: 200,
-                height: 200,
-            })).with_renderer(
-            QuadRenderer { color: c1 }).build(),
-        );
-        let c2 = self.push_widget(
-            WidgetBuilder::new().with_layouter(SizedBoxLayouter::new(Size {
-                width: 200,
-                height: 200,
-            })).with_renderer(
-            QuadRenderer { color: c2 }).build(),
-        );
-        self.push_children(row, &[c1, c2]);
+        // let row = self.push_widget(WidgetBuilder::new().with_layouter(RowLayouter::default()).build());
+        // self.push_child(root, row);
+
+        // let c1 = self.push_widget(
+        //     WidgetBuilder::new().with_layouter(SizedBoxLayouter::new(Size {
+        //         width: 200,
+        //         height: 200,
+        //     })).with_renderer(
+        //     QuadRenderer { color: c1 }).build(),
+        // );
+        // let c2 = self.push_widget(
+        //     WidgetBuilder::new().with_layouter(SizedBoxLayouter::new(Size {
+        //         width: 200,
+        //         height: 200,
+        //     })).with_renderer(
+        //     QuadRenderer { color: c2 }).build(),
+        // );
+        // self.push_children(row, &[c1, c2]);
     }
 }
 

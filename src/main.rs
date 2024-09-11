@@ -15,7 +15,9 @@ use winit::{
 };
 
 use geometry::{Point, Rect, Size};
-use layout::{DefaultLayouter, LayoutConstraint, Layouter, PaddedLayouter, RowLayouter, SizedBoxLayouter};
+use layout::{
+    DefaultLayouter, LayoutConstraint, Layouter, PaddedLayouter, RowLayouter, SizedBoxLayouter,
+};
 use quad_backend::QuadBackend;
 use render::{DefaultRenderer, QuadRenderer, RenderContext, Renderer};
 
@@ -238,71 +240,146 @@ impl State {
     }
 }
 
-struct Widget<L, R> where L: Layouter, R: Renderer {
-    layouter: L,
-    renderer: R,
+pub struct Widget<L, R>
+where
+    L: Layouter,
+    R: Renderer,
+{
+    pub layouter: L,
+    pub renderer: R,
 }
 
-impl<L, R> Widget<L, R> where L: Layouter, R: Renderer {
-    fn new(layouter: L, renderer: R) -> Self {
+impl<L, R> Widget<L, R>
+where
+    L: Layouter,
+    R: Renderer,
+{
+    pub fn new(layouter: L, renderer: R) -> Self {
         Self { layouter, renderer }
     }
 }
 
-struct WidgetBuilder<L, R> where L: Layouter, R: Renderer {
-    layouter: L,
-    renderer: R,
+pub struct WidgetBuilder<L, R>
+where
+    L: Layouter,
+    R: Renderer,
+{
+    pub layouter: L,
+    pub renderer: R,
 }
 
 impl WidgetBuilder<DefaultLayouter, DefaultRenderer> {
-    fn new() -> Self {
-        WidgetBuilder { layouter: DefaultLayouter{}, renderer: DefaultRenderer{} }
+    pub fn new() -> Self {
+        WidgetBuilder {
+            layouter: DefaultLayouter {},
+            renderer: DefaultRenderer {},
+        }
     }
 }
 
-impl<L, R> WidgetBuilder<L, R> where L: Layouter, R: Renderer {
-    fn with_layouter<LL>(self, layouter: LL) -> WidgetBuilder<LL, R> where LL: Layouter {
-        WidgetBuilder { layouter, renderer: self.renderer }
+impl<L> WidgetBuilder<L, DefaultRenderer> where L: Layouter + 'static {
+    pub fn from_layouter(layouter: L) -> WidgetBuilder<L, DefaultRenderer> {
+        WidgetBuilder {
+            layouter,
+            renderer: DefaultRenderer {},
+        }
+    }
+}
+
+impl<R> WidgetBuilder<DefaultLayouter, R> where R: Renderer + 'static {
+    pub fn from_renderer(renderer: R) -> WidgetBuilder<DefaultLayouter, R> {
+        WidgetBuilder {
+            layouter: DefaultLayouter {},
+            renderer,
+        }
+    }
+}
+
+impl<L, R> WidgetBuilder<L, R>
+where
+    L: Layouter,
+    R: Renderer,
+{
+    pub fn with_layouter<LL>(self, layouter: LL) -> WidgetBuilder<LL, R>
+    where
+        LL: Layouter,
+    {
+        WidgetBuilder {
+            layouter,
+            renderer: self.renderer,
+        }
     }
 
-    fn with_renderer<RR>(self, renderer: RR) -> WidgetBuilder<L, RR> where RR: Renderer {
-        WidgetBuilder { layouter: self.layouter, renderer }
+    pub fn with_renderer<RR>(self, renderer: RR) -> WidgetBuilder<L, RR>
+    where
+        RR: Renderer,
+    {
+        WidgetBuilder {
+            layouter: self.layouter,
+            renderer,
+        }
     }
 
-    fn build(self) -> Widget<L, R> {
+    pub fn build(self) -> Widget<L, R> {
         Widget::new(self.layouter, self.renderer)
     }
 }
 
-impl<L, R> Into<Widget<L, R>> for WidgetBuilder<L, R> where L: Layouter + 'static, R: Renderer + 'static {
+impl<L, R> Into<Widget<L, R>> for WidgetBuilder<L, R>
+where
+    L: Layouter + 'static,
+    R: Renderer + 'static,
+{
     fn into(self) -> Widget<L, R> {
         self.build()
     }
 }
 
-struct WidgetTreeBuilder<L, R> where L: Layouter + 'static, R: Renderer + 'static {
-    widget: Widget<L, R>,
-    children: Vec<Box<dyn FnOnce(&mut App) -> usize>>,
+pub struct WidgetTreeBuilder<L, R>
+where
+    L: Layouter + 'static,
+    R: Renderer + 'static,
+{
+    pub widget: Widget<L, R>,
+    pub children: Vec<Box<dyn FnOnce(&mut App) -> usize>>,
 }
 
 impl WidgetTreeBuilder<DefaultLayouter, DefaultRenderer> {
-    fn new() -> WidgetTreeBuilder<DefaultLayouter, DefaultRenderer> {
-        WidgetTreeBuilder { widget: Widget::new(DefaultLayouter{}, DefaultRenderer{}), children: Vec::new() }
+    pub fn new() -> WidgetTreeBuilder<DefaultLayouter, DefaultRenderer> {
+        WidgetTreeBuilder {
+            widget: Widget::new(DefaultLayouter {}, DefaultRenderer {}),
+            children: Vec::new(),
+        }
     }
 }
 
-impl<L, R> WidgetTreeBuilder<L, R> where L: Layouter + 'static, R: Renderer + 'static {
-    fn with_widget<LL, RR>(self, widget: Widget<LL, RR>) -> WidgetTreeBuilder<LL, RR>
-    where
-        LL: Layouter + 'static,
-        RR: Renderer + 'static, {
-            WidgetTreeBuilder { widget, children: self.children }
+impl<L, R> WidgetTreeBuilder<L, R>
+where
+    L: Layouter + 'static,
+    R: Renderer + 'static,
+{
+    pub fn with_root(widget: impl Into<Widget<L, R>>) -> WidgetTreeBuilder<L, R> {
+        WidgetTreeBuilder {
+            widget: widget.into(),
+            children: Vec::new(),
         }
+    }
 
-    fn child<LL, RR>(mut self, child: WidgetTreeBuilder<LL, RR>) -> Self 
+    pub fn with_widget<LL, RR>(self, widget: impl Into<Widget<LL, RR>>) -> WidgetTreeBuilder<LL, RR>
     where
         LL: Layouter + 'static,
-        RR: Renderer + 'static
+        RR: Renderer + 'static,
+    {
+        WidgetTreeBuilder {
+            widget: widget.into(),
+            children: self.children,
+        }
+    }
+
+    pub fn child<LL, RR>(mut self, child: WidgetTreeBuilder<LL, RR>) -> Self
+    where
+        LL: Layouter + 'static,
+        RR: Renderer + 'static,
     {
         self.children.push(Box::new(move |app| child.build(app)));
         self
@@ -311,25 +388,29 @@ impl<L, R> WidgetTreeBuilder<L, R> where L: Layouter + 'static, R: Renderer + 's
     fn build(self, app: &mut App) -> usize {
         let id = app.push_widget(self.widget);
 
-        let child_ids = self.children.into_iter().map(|child| child(app)).collect::<Vec<_>>();
+        let child_ids = self
+            .children
+            .into_iter()
+            .map(|child| child(app))
+            .collect::<Vec<_>>();
         app.push_children(id, &child_ids);
 
         id
     }
 }
 
-struct App {
-    state: Option<Arc<Mutex<State>>>,
-    window: Option<Arc<Window>>,
-    keydown_callbacks: Vec<Box<dyn Fn() + 'static>>,
+pub struct App {
+    pub state: Option<Arc<Mutex<State>>>,
+    pub window: Option<Arc<Window>>,
+    pub keydown_callbacks: Vec<Box<dyn Fn() + 'static>>,
 }
 
 impl App {
-    fn on_keydown(&mut self, callback: impl Fn() + 'static) {
+    pub fn on_keydown(&mut self, callback: impl Fn() + 'static) {
         self.keydown_callbacks.push(Box::new(callback));
     }
 
-    fn push_widget<L, R>(&mut self, widget: Widget<L, R>) -> usize
+    pub fn push_widget<L, R>(&mut self, widget: Widget<L, R>) -> usize
     where
         L: Layouter + 'static,
         R: Renderer + 'static,
@@ -358,16 +439,16 @@ impl App {
         id
     }
 
-    fn push_child(&mut self, parent: usize, child: usize) {
+    pub fn push_child(&mut self, parent: usize, child: usize) {
         self.state.as_ref().unwrap().lock().unwrap().children[parent].push(child);
     }
 
-    fn push_children(&mut self, parent: usize, children: &[usize]) {
+    pub fn push_children(&mut self, parent: usize, children: &[usize]) {
         self.state.as_ref().unwrap().lock().unwrap().children[parent]
             .append(&mut children.to_vec());
     }
 
-    fn setup(&mut self) {
+    pub fn setup(&mut self) {
         let c1 = create_rw_signal([0.0, 0.5, 0.4]);
         let c2 = create_rw_signal([0.0, 0.5, 0.4]);
 
@@ -379,31 +460,34 @@ impl App {
             }
         });
 
-        WidgetTreeBuilder::new()
-            .with_widget(WidgetBuilder::new().with_layouter(PaddedLayouter::new(100, 100, 100, 100)).build())
-            .child(WidgetTreeBuilder::new()
-                .with_widget(WidgetBuilder::new().with_layouter(RowLayouter::default()).build())
-                .child(
-                    WidgetTreeBuilder::new().with_widget(
-                        WidgetBuilder::new().with_layouter(SizedBoxLayouter::new(Size {
+        WidgetTreeBuilder::with_root(
+            WidgetBuilder::from_layouter(PaddedLayouter::new(100, 100, 100, 100)),
+        )
+        .child(
+            WidgetTreeBuilder::with_root(
+                WidgetBuilder::from_layouter(RowLayouter::default()),
+            )
+            .child(WidgetTreeBuilder::with_root(
+                WidgetBuilder::new()
+                    .with_layouter(SizedBoxLayouter::new(Size {
+                        width: 200,
+                        height: 200,
+                    }))
+                    .with_renderer(QuadRenderer { color: c1 }),
+            ))
+            .child(
+                // child 2
+                WidgetTreeBuilder::with_root(
+                    WidgetBuilder::new()
+                        .with_layouter(SizedBoxLayouter::new(Size {
                             width: 200,
                             height: 200,
-                        })).with_renderer(
-                        QuadRenderer { color: c1 })
-                        .build(),
-                    )
-                ).child(
-                    // child 2
-                    WidgetTreeBuilder::new().with_widget(
-                        WidgetBuilder::new().with_layouter(SizedBoxLayouter::new(Size {
-                            width: 200,
-                            height: 200,
-                        })).with_renderer(
-                        QuadRenderer { color: c2 })
-                        .build(),
-                    ),
-                ))
-            .build(self);
+                        }))
+                        .with_renderer(QuadRenderer { color: c2 }),
+                ),
+            ),
+        )
+        .build(self);
 
         // let root_widget = WidgetBuilder::new().with_layouter(PaddedLayouter::new(100, 100, 100, 100)).build();
         // let root = self.push_widget(root_widget);
@@ -453,7 +537,7 @@ impl ApplicationHandler for App {
             .unwrap()
             .needs_render
             .clone();
-        
+
         let window = self.window.as_ref().unwrap().clone();
 
         create_effect(move |_| {
@@ -517,7 +601,13 @@ impl ApplicationHandler for App {
 
                 self.state.as_mut().unwrap().lock().unwrap().layout_root();
 
-                self.state.as_mut().unwrap().lock().unwrap().render().unwrap();
+                self.state
+                    .as_mut()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .render()
+                    .unwrap();
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 // self.color.set([0.8, 0.1, 0.0]);

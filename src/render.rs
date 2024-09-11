@@ -1,6 +1,6 @@
 use floem_reactive::RwSignal;
 
-use crate::{geometry::{Point, Rect, Size}, quad_backend::QuadBackend};
+use crate::{geometry::Rect, quad_backend::QuadBackend};
 
 pub struct RenderContext<'a> {
     pub rect: Rect,

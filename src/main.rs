@@ -15,7 +15,7 @@ use winit::{
 };
 
 use geometry::{Point, Rect, Size};
-use layout::{LayoutConstraint, Layouter, PaddedLayouter, RowLayouter, SizedBoxLayouter};
+use layout::{DefaultLayouter, LayoutConstraint, Layouter, PaddedLayouter, RowLayouter, SizedBoxLayouter};
 use quad_backend::QuadBackend;
 use render::{DefaultRenderer, QuadRenderer, RenderContext, Renderer};
 
@@ -25,16 +25,7 @@ fn main() {
 
 async fn run() {
     let event_loop = EventLoop::new().unwrap();
-
-    // ControlFlow::Poll continuously runs the event loop, even if the OS hasn't
-    // dispatched any events. This is ideal for games and similar applications.
-    event_loop.set_control_flow(ControlFlow::Poll);
-
-    // ControlFlow::Wait pauses the event loop if no events are available to process.
-    // This is ideal for non-game applications that only update in response to user
-    // input, and uses significantly less power/CPU time than ControlFlow::Poll.
     event_loop.set_control_flow(ControlFlow::Wait);
-
     let mut app = App {
         state: None,
         window: None,
@@ -239,11 +230,46 @@ impl State {
 
         self.quad_backend.render(&mut encoder, &self.queue, &view);
 
-        // submit will accept anything that implements IntoIter
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
 
         Ok(())
+    }
+}
+
+struct Widget<L, R> where L: Layouter, R: Renderer {
+    layouter: L,
+    renderer: R,
+}
+
+impl<L, R> Widget<L, R> where L: Layouter, R: Renderer {
+    fn new(layouter: L, renderer: R) -> Self {
+        Self { layouter, renderer }
+    }
+}
+
+struct WidgetBuilder<L, R> where L: Layouter, R: Renderer {
+    layouter: L,
+    renderer: R,
+}
+
+impl WidgetBuilder<DefaultLayouter, DefaultRenderer> {
+    fn new() -> Self {
+        WidgetBuilder { layouter: DefaultLayouter{}, renderer: DefaultRenderer{} }
+    }
+}
+
+impl<L, R> WidgetBuilder<L, R> where L: Layouter, R: Renderer {
+    fn with_layouter<LL>(self, layouter: LL) -> WidgetBuilder<LL, R> where LL: Layouter {
+        WidgetBuilder { layouter, renderer: self.renderer }
+    }
+
+    fn with_renderer<RR>(self, renderer: RR) -> WidgetBuilder<L, RR> where RR: Renderer {
+        WidgetBuilder { layouter: self.layouter, renderer }
+    }
+
+    fn build(self) -> Widget<L, R> {
+        Widget::new(self.layouter, self.renderer)
     }
 }
 
@@ -258,12 +284,12 @@ impl App {
         self.keydown_callbacks.push(Box::new(callback));
     }
 
-    fn push_widget<L, R>(&mut self, layouter: L, renderer: R) -> usize
+    fn push_widget<L, R>(&mut self, widget: Widget<L, R>) -> usize
     where
         L: Layouter + 'static,
         R: Renderer + 'static,
     {
-        let renderer = Arc::new(Mutex::new(renderer));
+        let renderer = Arc::new(Mutex::new(widget.renderer));
 
         let id = self
             .state
@@ -271,7 +297,7 @@ impl App {
             .unwrap()
             .lock()
             .unwrap()
-            .push_widget(layouter, renderer.clone());
+            .push_widget(widget.layouter, renderer.clone());
 
         let state = self.state.as_ref().unwrap().clone();
         create_effect(move |_| {
@@ -297,30 +323,37 @@ impl App {
     }
 
     fn setup(&mut self) {
-        let color = create_rw_signal([0.0, 0.5, 0.4]);
+        let c1 = create_rw_signal([0.0, 0.5, 0.4]);
+        let c2 = create_rw_signal([0.0, 0.5, 0.4]);
 
         self.on_keydown(move || {
-            color.set([0.6, 0.0, 0.0]);
+            if rand::random::<bool>() {
+                c1.set(rand::random());
+            } else {
+                c2.set(rand::random());
+            }
         });
 
-        let root = self.push_widget(PaddedLayouter::new(100, 100, 100, 100), DefaultRenderer {});
-        let row = self.push_widget(RowLayouter::default(), DefaultRenderer {});
+        let root_widget = WidgetBuilder::new().with_layouter(PaddedLayouter::new(100, 100, 100, 100)).build();
+        let root = self.push_widget(root_widget);
+
+        let row = self.push_widget(WidgetBuilder::new().with_layouter(RowLayouter::default()).build());
+        self.push_child(root, row);
+
         let c1 = self.push_widget(
-            SizedBoxLayouter::new(Size {
+            WidgetBuilder::new().with_layouter(SizedBoxLayouter::new(Size {
                 width: 200,
                 height: 200,
-            }),
-            QuadRenderer { color },
+            })).with_renderer(
+            QuadRenderer { color: c1 }).build(),
         );
         let c2 = self.push_widget(
-            SizedBoxLayouter::new(Size {
+            WidgetBuilder::new().with_layouter(SizedBoxLayouter::new(Size {
                 width: 200,
                 height: 200,
-            }),
-            QuadRenderer { color },
+            })).with_renderer(
+            QuadRenderer { color: c2 }).build(),
         );
-
-        self.push_child(root, row);
         self.push_children(row, &[c1, c2]);
     }
 }
@@ -341,15 +374,6 @@ impl ApplicationHandler for App {
 
         self.setup();
 
-        self.state
-            .as_ref()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .render()
-            .unwrap();
-        self.window.as_ref().unwrap().request_redraw();
-
         let needs_render = self
             .state
             .as_ref()
@@ -358,7 +382,9 @@ impl ApplicationHandler for App {
             .unwrap()
             .needs_render
             .clone();
+        
         let window = self.window.as_ref().unwrap().clone();
+
         create_effect(move |_| {
             needs_render.get();
             window.request_redraw();
@@ -408,7 +434,7 @@ impl ApplicationHandler for App {
                     .lock()
                     .unwrap()
                     .needs_render
-                    .set(Vec::new());
+                    .update(|n| n.clear());
             }
             WindowEvent::Resized(new_size) => {
                 self.state
@@ -417,7 +443,10 @@ impl ApplicationHandler for App {
                     .lock()
                     .unwrap()
                     .resize(new_size);
+
                 self.state.as_mut().unwrap().lock().unwrap().layout_root();
+
+                self.state.as_mut().unwrap().lock().unwrap().render().unwrap();
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 // self.color.set([0.8, 0.1, 0.0]);

@@ -17,7 +17,7 @@ use winit::{
 use geometry::{Point, Rect, Size};
 use layout::{LayoutConstraint, Layouter, PaddedLayouter, RowLayouter, SizedBoxLayouter};
 use quad_backend::QuadBackend;
-use render::{DefaultRenderContext, DefaultRenderer, DummyRenderContext, QuadRenderer, Renderer};
+use render::{DefaultRenderer, QuadRenderer, RenderContext, Renderer};
 
 fn main() {
     pollster::block_on(run());
@@ -39,13 +39,12 @@ async fn run() {
         state: None,
         window: None,
         keydown_callbacks: Default::default(),
-        color: create_rw_signal([0.0, 0.5, 0.4]),
     };
     event_loop.run_app(&mut app).unwrap();
 }
 
-pub struct State<'a> {
-    pub surface: wgpu::Surface<'a>,
+pub struct State {
+    pub surface: wgpu::Surface<'static>,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub config: wgpu::SurfaceConfiguration,
@@ -59,8 +58,8 @@ pub struct State<'a> {
     pub needs_render: RwSignal<Vec<usize>>,
 }
 
-impl<'a> State<'a> {
-    pub async fn new(window: Arc<Window>) -> State<'a> {
+impl State {
+    pub async fn new(window: Arc<Window>) -> State {
         let size = window.inner_size();
 
         // The instance is a handle to our GPU
@@ -136,7 +135,7 @@ impl<'a> State<'a> {
         }
     }
 
-    fn push_widget<L, R>(&mut self, layouter: L, renderer: R) -> usize
+    fn push_widget<L, R>(&mut self, layouter: L, renderer: Arc<Mutex<R>>) -> usize
     where
         L: Layouter + 'static,
         R: Renderer + 'static,
@@ -154,17 +153,7 @@ impl<'a> State<'a> {
         });
 
         self.layouters.push(Box::new(layouter));
-
-        let renderer = Arc::new(Mutex::new(renderer));
-        self.renderers.push(renderer.clone());
-
-        let renderer = renderer.clone();
-        let needs_render = self.needs_render.clone();
-        create_effect(move |_| {
-            println!("Effect - rendering {}", id);
-            renderer.lock().unwrap().render(&mut DummyRenderContext {});
-            needs_render.update(|n| n.push(id));
-        });
+        self.renderers.push(renderer);
 
         id
     }
@@ -232,7 +221,7 @@ impl<'a> State<'a> {
         self.quad_backend.clear();
 
         for (idx, renderer) in self.renderers.iter_mut().enumerate() {
-            renderer.lock().unwrap().render(&mut DefaultRenderContext {
+            renderer.lock().unwrap().render(&mut RenderContext {
                 rect: self.rects[idx],
                 quad_backend: &mut self.quad_backend,
             });
@@ -258,55 +247,117 @@ impl<'a> State<'a> {
     }
 }
 
-struct App<'a> {
-    state: Option<State<'a>>,
+struct App {
+    state: Option<Arc<Mutex<State>>>,
     window: Option<Arc<Window>>,
     keydown_callbacks: Vec<Box<dyn Fn() + 'static>>,
-    color: RwSignal<[f32; 3]>,
 }
 
-impl<'a> App<'a> {
+impl App {
     fn on_keydown(&mut self, callback: impl Fn() + 'static) {
         self.keydown_callbacks.push(Box::new(callback));
     }
+
+    fn push_widget<L, R>(&mut self, layouter: L, renderer: R) -> usize
+    where
+        L: Layouter + 'static,
+        R: Renderer + 'static,
+    {
+        let renderer = Arc::new(Mutex::new(renderer));
+
+        let id = self
+            .state
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .push_widget(layouter, renderer.clone());
+
+        let state = self.state.as_ref().unwrap().clone();
+        create_effect(move |_| {
+            println!("Effect - rendering {}", id);
+            let mut state = state.lock().unwrap();
+            renderer.lock().unwrap().render(&mut RenderContext {
+                rect: state.rects[id],
+                quad_backend: &mut state.quad_backend,
+            });
+            state.needs_render.update(|n| n.push(id));
+        });
+
+        id
+    }
+
+    fn push_child(&mut self, parent: usize, child: usize) {
+        self.state.as_ref().unwrap().lock().unwrap().children[parent].push(child);
+    }
+
+    fn push_children(&mut self, parent: usize, children: &[usize]) {
+        self.state.as_ref().unwrap().lock().unwrap().children[parent]
+            .append(&mut children.to_vec());
+    }
+
+    fn setup(&mut self) {
+        let color = create_rw_signal([0.0, 0.5, 0.4]);
+
+        self.on_keydown(move || {
+            color.set([0.6, 0.0, 0.0]);
+        });
+
+        let root = self.push_widget(PaddedLayouter::new(100, 100, 100, 100), DefaultRenderer {});
+        let row = self.push_widget(RowLayouter::default(), DefaultRenderer {});
+        let c1 = self.push_widget(
+            SizedBoxLayouter::new(Size {
+                width: 200,
+                height: 200,
+            }),
+            QuadRenderer { color },
+        );
+        let c2 = self.push_widget(
+            SizedBoxLayouter::new(Size {
+                width: 200,
+                height: 200,
+            }),
+            QuadRenderer { color },
+        );
+
+        self.push_child(root, row);
+        self.push_children(row, &[c1, c2]);
+    }
 }
 
-impl<'a> ApplicationHandler for App<'a> {
+impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let window = event_loop
             .create_window(Window::default_attributes())
             .unwrap();
         let window = Arc::new(window);
-        let mut state = pollster::block_on(State::new(Arc::clone(&window)));
 
-        self.color = create_rw_signal([0.0, 0.5, 0.4]);
-
-        let root = state.push_widget(PaddedLayouter::new(100, 100, 100, 100), DefaultRenderer {});
-        let row = state.push_widget(RowLayouter::default(), DefaultRenderer {});
-        let c1 = state.push_widget(
-            SizedBoxLayouter::new(Size { width: 200, height: 200 }),
-            QuadRenderer {
-                color: self.color
-            },
-        );
-        // let c2 = state.push_widget(SizedBoxLayouter::new(20, 50), QuadRenderer { color: [0.8, 0.3, 0.0] });
-
-        let color = self.color.clone();
-        self.on_keydown(move || {
-            color.set([0.6, 0.0, 0.0]);
-        });
-
-        state.children[root].push(row);
-        // state.children[row].append(&mut vec![c1, c2]);
-        state.children[row].append(&mut vec![c1]);
+        let state = Arc::new(Mutex::new(pollster::block_on(State::new(Arc::clone(
+            &window,
+        )))));
 
         self.window = Some(window);
         self.state = Some(state);
 
-        self.state.as_mut().unwrap().render().unwrap();
+        self.setup();
+
+        self.state
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .render()
+            .unwrap();
         self.window.as_ref().unwrap().request_redraw();
 
-        let needs_render = self.state.as_ref().unwrap().needs_render.clone();
+        let needs_render = self
+            .state
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .needs_render
+            .clone();
         let window = self.window.as_ref().unwrap().clone();
         create_effect(move |_| {
             needs_render.get();
@@ -320,19 +371,53 @@ impl<'a> ApplicationHandler for App<'a> {
                 event_loop.exit();
             }
             WindowEvent::RedrawRequested => {
-                for id in self.state.as_ref().unwrap().needs_render.get() {
+                for id in self
+                    .state
+                    .as_ref()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .needs_render
+                    .get()
+                {
                     println!("Rendering {}", id);
                 }
 
-                if !self.state.as_ref().unwrap().needs_render.get().is_empty() {
-                    self.state.as_mut().unwrap().render().unwrap();
+                if !self
+                    .state
+                    .as_ref()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .needs_render
+                    .get()
+                    .is_empty()
+                {
+                    self.state
+                        .as_mut()
+                        .unwrap()
+                        .lock()
+                        .unwrap()
+                        .render()
+                        .unwrap();
                 }
 
-                self.state.as_mut().unwrap().needs_render.set(Vec::new());
+                self.state
+                    .as_mut()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .needs_render
+                    .set(Vec::new());
             }
             WindowEvent::Resized(new_size) => {
-                self.state.as_mut().unwrap().resize(new_size);
-                self.state.as_mut().unwrap().layout_root();
+                self.state
+                    .as_mut()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .resize(new_size);
+                self.state.as_mut().unwrap().lock().unwrap().layout_root();
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 // self.color.set([0.8, 0.1, 0.0]);

@@ -1,214 +1,573 @@
-pub mod geometry;
-pub mod layout;
-pub mod quad_backend;
-pub mod render;
-pub mod tree;
+// Copyright 2024 the Vello Authors
+// SPDX-License-Identifier: Apache-2.0 OR MIT
 
-use std::sync::{Arc, Mutex, MutexGuard};
+//! Simple example.
 
-use floem_reactive::{create_effect, create_rw_signal, RwSignal};
-use geometry::Size;
-use tree::{Padded, SizedBox, Tree};
-use winit::event::ElementState;
-use winit::{
-    application::ApplicationHandler,
-    event::WindowEvent,
-    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
-    window::{Window, WindowId},
-};
+use anyhow::Result;
+use petgraph::graph::{DiGraph, NodeIndex};
+use std::collections::HashMap;
+use std::num::NonZeroUsize;
+use std::sync::Arc;
+use vello::kurbo::{Affine, Point, Rect, RoundedRect, Size, Stroke};
+use vello::peniko::color::palette;
+use vello::peniko::Color;
+use vello::util::{RenderContext, RenderSurface};
+use vello::wgpu;
+use vello::{AaConfig, Renderer, RendererOptions, Scene};
+use winit::application::ApplicationHandler;
+use winit::dpi::LogicalSize;
+use winit::event::WindowEvent;
+use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::window::Window;
 
-use quad_backend::QuadBackend;
-
-fn main() {
-    pollster::block_on(run());
+/// Simple struct to hold the state of the renderer
+#[derive(Debug)]
+pub struct ActiveRenderState<'s> {
+    // The fields MUST be in this order, so that the surface is dropped before the window
+    surface: RenderSurface<'s>,
+    window: Arc<Window>,
 }
 
-async fn run() {
-    let event_loop = EventLoop::new().unwrap();
-    event_loop.set_control_flow(ControlFlow::Wait);
-    let mut app = App {
-        state: None,
-        window: None,
-        key: create_rw_signal(0),
-    };
-    event_loop.run_app(&mut app).unwrap();
+enum RenderState<'s> {
+    Active(ActiveRenderState<'s>),
+    // Cache a window so that it can be reused when the app is resumed after being suspended
+    Suspended(Option<Arc<Window>>),
 }
 
-pub struct State {
-    pub surface: wgpu::Surface<'static>,
-    pub device: wgpu::Device,
-    pub queue: wgpu::Queue,
-    pub config: wgpu::SurfaceConfiguration,
-    pub win_size: winit::dpi::PhysicalSize<u32>,
-    pub layout_tree: Tree,
-    pub quad_backend: QuadBackend,
+struct SimpleVelloApp<'s> {
+    // The vello RenderContext which is a global context that lasts for the
+    // lifetime of the application
+    context: RenderContext,
+
+    // An array of renderers, one per wgpu device
+    renderers: Vec<Option<Renderer>>,
+
+    // State for our example where we store the winit Window and the wgpu Surface
+    state: RenderState<'s>,
+
+    // A vello Scene which is a data structure which allows one to build up a
+    // description a scene to be drawn (with paths, fills, images, text, etc)
+    // which is then passed to a renderer for rendering
+    scene: Scene,
+
+    widget_tree: WidgetTree,
 }
 
-impl State {
-    pub async fn new(window: Arc<Window>) -> State {
-        let size = window.inner_size();
+#[derive(Clone, Copy)]
+struct Constraints {
+    min: Size,
+    max: Size,
+}
 
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            #[cfg(not(target_arch = "wasm32"))]
-            backends: wgpu::Backends::PRIMARY,
-            ..Default::default()
+#[derive(Clone, Copy)]
+struct LayouterConstrainChildrenCtx {
+    constraints: Constraints,
+}
+
+#[derive(Clone, Copy)]
+struct LayoutChildWasSizedCtx {
+    child_size: Size,
+}
+
+#[derive(Clone, Copy)]
+struct LayouterSizeSelfCtx {
+    constraints: Constraints,
+}
+
+trait Layouter {
+    fn callback_begin_layout(&mut self);
+    fn constrain_child(&mut self, ctx: LayouterConstrainChildrenCtx) -> Constraints;
+    fn child_was_sized_compute_position(&mut self, ctx: LayoutChildWasSizedCtx) -> Point;
+    fn size_self(&mut self, ctx: LayouterSizeSelfCtx) -> Size;
+    //fn callback_end_layout(&mut self);
+}
+
+struct RowLayouter {
+    child_sizes: Vec<Size>,
+}
+
+impl Layouter for RowLayouter {
+    fn callback_begin_layout(&mut self) {
+        println!("RowLayouter::callback_begin_layout");
+        self.child_sizes.clear();
+    }
+
+    fn constrain_child(&mut self, ctx: LayouterConstrainChildrenCtx) -> Constraints {
+        println!("RowLayouter::constrain_child");
+        Constraints {
+            min: ctx.constraints.min,
+            max: Size {
+                width: ctx.constraints.max.width
+                    - self
+                        .child_sizes
+                        .iter()
+                        .fold(0.0, |acc, size| acc + size.width),
+                height: ctx.constraints.max.height,
+            },
+        }
+    }
+
+    fn child_was_sized_compute_position(&mut self, ctx: LayoutChildWasSizedCtx) -> Point {
+        println!("RowLayouter::child_was_sized: {:?}", ctx.child_size);
+        self.child_sizes.push(ctx.child_size);
+        Point::new(
+            self.child_sizes
+                .iter()
+                .fold(0.0, |acc, size| acc + size.width),
+            0.0,
+        )
+    }
+
+    fn size_self(&mut self, _ctx: LayouterSizeSelfCtx) -> Size {
+        println!("RowLayouter::size_self");
+        self.child_sizes
+            .iter()
+            .fold(Size::new(0.0, 0.0), |acc, size| acc + *size)
+    }
+}
+
+struct DrawerCtx<'a> {
+    rect: Rect,
+    scene: &'a mut Scene,
+}
+
+trait Drawer {
+    fn draw(&mut self, ctx: DrawerCtx);
+}
+
+struct WidgetTreeWeight {
+    layouter: Box<dyn Layouter>,
+    drawer: Option<Box<dyn Drawer>>,
+    position: Point,
+    size: Size,
+}
+
+struct WidgetTree {
+    t: DiGraph<WidgetTreeWeight, ()>,
+    root: Option<NodeIndex>,
+    dependencies: HashMap<NodeIndex, Vec<NodeIndex>>,
+}
+
+impl WidgetTree {
+    pub fn new() -> Self {
+        Self {
+            t: DiGraph::<WidgetTreeWeight, ()>::new(),
+            root: None,
+            dependencies: HashMap::new(),
+        }
+    }
+
+    pub fn add_node(
+        &mut self,
+        layouter: Box<dyn Layouter>,
+        drawer: Option<Box<dyn Drawer>>,
+    ) -> NodeIndex {
+        let idx = self.t.add_node(WidgetTreeWeight {
+            layouter,
+            drawer,
+            position: Point::ORIGIN,
+            size: Size::ZERO,
         });
 
-        let surface = instance.create_surface(window).unwrap();
+        if self.root.is_none() {
+            self.root = Some(idx)
+        }
 
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::default(),
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-            })
-            .await
-            .unwrap();
+        idx
+    }
 
-        let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::default(),
-                    memory_hints: wgpu::MemoryHints::default(),
-                    label: None,
-                },
-                None, // Trace path
-            )
-            .await
-            .unwrap();
+    pub fn layout(&mut self, constraints: Constraints) {
+        let Some(root) = self.root else { return };
+        self.layout_index(root, constraints);
+    }
 
-        let surface_caps = surface.get_capabilities(&adapter);
+    fn layout_index(&mut self, index: NodeIndex, constraints: Constraints) -> Size {
+        {
+            let WidgetTreeWeight { layouter, .. } = self.t.node_weight_mut(index).unwrap();
+            layouter.callback_begin_layout();
+        }
 
-        let surface_format = surface_caps
-            .formats
-            .iter()
-            .find(|f| f.is_srgb())
-            .copied()
-            .unwrap_or(surface_caps.formats[0]);
+        // todo(chad): performance
+        let children = self
+            .t
+            .neighbors_directed(index, petgraph::Direction::Outgoing)
+            .collect::<Vec<_>>();
 
-        let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: surface_format,
-            width: size.width,
-            height: size.height,
-            present_mode: surface_caps.present_modes[0],
-            alpha_mode: surface_caps.alpha_modes[0],
-            view_formats: vec![],
-            desired_maximum_frame_latency: 2,
+        // constraints flow down, sizes flow up
+        for child in children {
+            // todo(chad): performance
+            let child_constraints = {
+                let WidgetTreeWeight { layouter, .. } = self.t.node_weight_mut(index).unwrap();
+                layouter.constrain_child(LayouterConstrainChildrenCtx { constraints })
+            };
+
+            let child_size = self.layout_index(child, child_constraints);
+            self.t.node_weight_mut(child).unwrap().size = child_size;
+
+            {
+                let WidgetTreeWeight { layouter, .. } = self.t.node_weight_mut(index).unwrap();
+                let child_position = layouter
+                    .child_was_sized_compute_position(LayoutChildWasSizedCtx { child_size });
+                self.t.node_weight_mut(child).unwrap().position = child_position;
+            }
+        }
+
+        let WidgetTreeWeight { layouter, .. } = self.t.node_weight_mut(index).unwrap();
+        layouter.size_self(LayouterSizeSelfCtx { constraints })
+    }
+
+    pub fn draw_index(&mut self, index: NodeIndex, scene: &mut Scene, offset_pos: Point) {
+        let WidgetTreeWeight {
+            drawer,
+            position,
+            size,
+            ..
+        } = self.t.node_weight_mut(index).unwrap();
+        let position = *position;
+        let size = *size;
+
+        if let Some(drawer) = drawer {
+            drawer.draw(DrawerCtx {
+                scene,
+                rect: Rect::from_origin_size(position, size),
+            });
+        }
+
+        // todo(chad): performance
+        let neighbors = self
+            .t
+            .neighbors_directed(index, petgraph::Direction::Outgoing)
+            .collect::<Vec<_>>();
+        for child in neighbors {
+            let offset_pos = Point::new(offset_pos.x + position.x, offset_pos.y + position.y);
+            self.draw_index(child, scene, offset_pos);
+        }
+    }
+
+    pub fn draw(&mut self, scene: &mut Scene) {
+        let Some(root) = self.root else { return };
+        self.draw_index(root, scene, Point::ORIGIN);
+    }
+}
+
+impl ApplicationHandler for SimpleVelloApp<'_> {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        let RenderState::Suspended(cached_window) = &mut self.state else {
+            return;
         };
 
-        let quad_backend = QuadBackend::new(&device, &config, size);
+        // Get the winit window cached in a previous Suspended event or else create a new window
+        let window = cached_window
+            .take()
+            .unwrap_or_else(|| create_winit_window(event_loop));
 
-        surface.configure(&device, &config);
-
-        let mut layout_tree = Tree::new();
-        layout_tree.push_with_child(
-            Padded::new(50, 50, 50, 50), 
-            SizedBox::new(Size { width: 200, height: 200 })
+        // Create a vello Surface
+        let size = window.inner_size();
+        let surface_future = self.context.create_surface(
+            window.clone(),
+            size.width,
+            size.height,
+            wgpu::PresentMode::AutoVsync,
         );
+        let surface = pollster::block_on(surface_future).expect("Error creating surface");
 
-        Self {
-            surface,
-            device,
-            queue,
-            config,
-            quad_backend,
-            win_size: size,
-            layout_tree,
-        } 
+        // Create a vello Renderer for the surface (using its device id)
+        self.renderers
+            .resize_with(self.context.devices.len(), || None);
+        self.renderers[surface.dev_id]
+            .get_or_insert_with(|| create_vello_renderer(&self.context, &surface));
+
+        // Save the Window and Surface to a state variable
+        self.state = RenderState::Active(ActiveRenderState { window, surface });
     }
 
-    pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
-        if new_size.width > 0 && new_size.height > 0 {
-            self.config.width = new_size.width;
-            self.config.height = new_size.height;
-            self.surface.configure(&self.device, &self.config);
-
-            self.quad_backend.win_size = new_size;
+    fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+        if let RenderState::Active(state) = &self.state {
+            self.state = RenderState::Suspended(Some(state.window.clone()));
         }
     }
 
-    pub fn layout(&mut self) {
-        self.layout_tree.layout(Size { width: self.win_size.width, height: self.win_size.height });
-    }
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: winit::window::WindowId,
+        event: WindowEvent,
+    ) {
+        // Ignore the event (return from the function) if
+        //   - we have no render_state
+        //   - OR the window id of the event doesn't match the window id of our render_state
+        //
+        // Else extract a mutable reference to the render state from its containing option for use below
+        let render_state = match &mut self.state {
+            RenderState::Active(state) if state.window.id() == window_id => state,
+            _ => return,
+        };
 
-    pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
-        self.quad_backend.clear();
-
-        for rect in self.layout_tree.rects.iter() {
-            self.quad_backend.push_quad(*rect, rand::random());
-        }
-
-        let output = self.surface.get_current_texture()?;
-        let view = output
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Render Encoder"),
-            });
-
-        self.quad_backend.render(&mut encoder, &self.queue, &view);
-
-        self.queue.submit(std::iter::once(encoder.finish()));
-        output.present();
-
-        Ok(())
-    }
-}
-
-pub struct App {
-    pub state: Option<Arc<Mutex<State>>>,
-    pub window: Option<Arc<Window>>,
-    pub key: RwSignal<i32>,
-}
-
-impl App {
-    pub fn state(&self) -> MutexGuard<'_, State> {
-        self.state.as_ref().unwrap().lock().unwrap()
-    }
-}
-
-impl ApplicationHandler for App {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        let window = event_loop
-            .create_window(Window::default_attributes())
-            .unwrap();
-        let window = Arc::new(window);
-
-        let state = Arc::new(Mutex::new(pollster::block_on(State::new(Arc::clone(
-            &window,
-        )))));
-
-        self.window = Some(window.clone());
-        self.state = Some(state);
-
-        let key = self.key.clone();
-        create_effect(move |_| {
-            key.get();
-            window.request_redraw();
-        });
-    }
-
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
-            WindowEvent::CloseRequested => {
-                event_loop.exit();
+            // Exit the event loop when a close is requested (e.g. window's close button is pressed)
+            WindowEvent::CloseRequested => event_loop.exit(),
+
+            // Resize the surface when the window is resized
+            WindowEvent::Resized(size) => {
+                self.context
+                    .resize_surface(&mut render_state.surface, size.width, size.height);
             }
+
+            // This is where all the rendering happens
             WindowEvent::RedrawRequested => {
-                println!("Redraw requested");
-                self.state().layout();
-                self.state().render().unwrap();
+                // Empty the scene of objects to draw. You could create a new Scene each time, but in this case
+                // the same Scene is reused so that the underlying memory allocation can also be reused.
+                self.scene.reset();
+
+                // Get the RenderSurface (surface + config)
+                let surface = &render_state.surface;
+
+                // Re-add the objects to draw to the scene.
+                // add_shapes_to_scene(&mut self.scene);
+                self.widget_tree.layout(Constraints {
+                    min: Size::new(0.0, 0.0),
+                    max: Size::new(surface.config.width as f64, surface.config.height as f64),
+                });
+                self.widget_tree.draw(&mut self.scene);
+
+                // Get the window size
+                let width = surface.config.width;
+                let height = surface.config.height;
+
+                // Get a handle to the device
+                let device_handle = &self.context.devices[surface.dev_id];
+
+                // Get the surface's texture
+                let surface_texture = surface
+                    .surface
+                    .get_current_texture()
+                    .expect("failed to get surface texture");
+
+                // Render to the surface's texture
+                self.renderers[surface.dev_id]
+                    .as_mut()
+                    .unwrap()
+                    .render_to_surface(
+                        &device_handle.device,
+                        &device_handle.queue,
+                        &self.scene,
+                        &surface_texture,
+                        &vello::RenderParams {
+                            base_color: palette::css::BLACK, // Background color
+                            width,
+                            height,
+                            antialiasing_method: AaConfig::Msaa16,
+                        },
+                    )
+                    .expect("failed to render to surface");
+
+                // Queue the texture to be presented on the surface
+                surface_texture.present();
+
+                device_handle.device.poll(wgpu::Maintain::Poll);
             }
-            WindowEvent::Resized(new_size) => {
-                self.state().resize(new_size);
-            }
-            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
-                self.key.set((self.key.get() + 1) % 100);
-            }
-            _ => (),
+            _ => {}
         }
     }
+}
+
+struct SimpleQuadDrawer {}
+
+impl Drawer for SimpleQuadDrawer {
+    fn draw(&mut self, ctx: DrawerCtx) {
+        // Draw an outlined rectangle
+        let stroke = Stroke::new(6.0);
+        let rect = RoundedRect::new(ctx.rect.x0, ctx.rect.y0, ctx.rect.x1, ctx.rect.y1, 20.0);
+        let rect_stroke_color = Color::new([0.9804, 0.702, 0.5294, 1.]);
+        let rect_fill_color = Color::new([0.6, 0.5, 0.3, 1.]);
+        ctx.scene.fill(
+            vello::peniko::Fill::NonZero,
+            Affine::IDENTITY,
+            rect_fill_color,
+            None,
+            &rect,
+        );
+        ctx.scene
+            .stroke(&stroke, Affine::IDENTITY, rect_stroke_color, None, &rect);
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Signal<T> {
+    value: T,
+}
+
+impl<T> Signal<T> {
+    fn track(&self) {}
+
+    fn get(&self) -> &T {
+        self.track();
+        &self.value
+    }
+
+    fn get_mut(&self) -> &T {
+        self.track();
+        &self.value
+    }
+}
+
+struct ReactiveSizedBoxLayouter {
+    size: Signal<Size>,
+}
+
+impl ReactiveSizedBoxLayouter {
+    fn new() -> Self {
+        Self {
+            size: Signal {
+                value: Size::new(100.0, 100.0),
+            },
+        }
+    }
+}
+
+impl Layouter for ReactiveSizedBoxLayouter {
+    fn size_self(&mut self, _ctx: LayouterSizeSelfCtx) -> Size {
+        *self.size.get()
+    }
+
+    fn callback_begin_layout(&mut self) {}
+
+    fn constrain_child(&mut self, ctx: LayouterConstrainChildrenCtx) -> Constraints {
+        ctx.constraints
+    }
+
+    fn child_was_sized_compute_position(&mut self, ctx: LayoutChildWasSizedCtx) -> Point {
+        Point::ORIGIN
+    }
+}
+
+struct SizedBoxLayouter {
+    size: Size,
+}
+
+impl Layouter for SizedBoxLayouter {
+    fn size_self(&mut self, _ctx: LayouterSizeSelfCtx) -> Size {
+        self.size
+    }
+
+    fn callback_begin_layout(&mut self) {}
+
+    fn constrain_child(&mut self, ctx: LayouterConstrainChildrenCtx) -> Constraints {
+        ctx.constraints
+    }
+
+    fn child_was_sized_compute_position(&mut self, ctx: LayoutChildWasSizedCtx) -> Point {
+        Point::ORIGIN
+    }
+}
+
+fn main() -> Result<()> {
+    let size_signal = Signal {
+        value: Size::new(100.0, 100.0),
+    };
+
+    let mut widget_tree = WidgetTree::new();
+    let root = widget_tree.add_node(
+        Box::new(RowLayouter {
+            child_sizes: vec![],
+        }),
+        None,
+    );
+    let child1 = widget_tree.add_node(
+        Box::new(ReactiveSizedBoxLayouter { size: size_signal }),
+        Some(Box::new(SimpleQuadDrawer {})),
+    );
+    let child2 = widget_tree.add_node(
+        Box::new(ReactiveSizedBoxLayouter { size: size_signal }),
+        Some(Box::new(SimpleQuadDrawer {})),
+    );
+    let child3 = widget_tree.add_node(
+        Box::new(ReactiveSizedBoxLayouter { size: size_signal }),
+        Some(Box::new(SimpleQuadDrawer {})),
+    );
+    widget_tree.t.add_edge(root, child1, ());
+    widget_tree.t.add_edge(root, child2, ());
+    widget_tree.t.add_edge(child1, child3, ());
+
+    let mut app = SimpleVelloApp {
+        context: RenderContext::new(),
+        renderers: vec![],
+        state: RenderState::Suspended(None),
+        scene: Scene::new(),
+        widget_tree,
+    };
+
+    let event_loop = EventLoop::new()?;
+    event_loop
+        .run_app(&mut app)
+        .expect("Couldn't run event loop");
+    Ok(())
+}
+
+/// Helper function that creates a Winit window and returns it (wrapped in an Arc for sharing between threads)
+fn create_winit_window(event_loop: &ActiveEventLoop) -> Arc<Window> {
+    let attr = Window::default_attributes()
+        .with_inner_size(LogicalSize::new(1044, 800))
+        .with_resizable(true)
+        .with_title("Vello Shapes");
+    Arc::new(event_loop.create_window(attr).unwrap())
+}
+
+/// Helper function that creates a vello `Renderer` for a given `RenderContext` and `RenderSurface`
+fn create_vello_renderer(render_cx: &RenderContext, surface: &RenderSurface<'_>) -> Renderer {
+    Renderer::new(
+        &render_cx.devices[surface.dev_id].device,
+        RendererOptions {
+            surface_format: Some(surface.format),
+            use_cpu: false,
+            antialiasing_support: vello::AaSupport::all(),
+            num_init_threads: NonZeroUsize::new(1),
+        },
+    )
+    .expect("Couldn't create renderer")
+}
+
+/// Add shapes to a vello scene. This does not actually render the shapes, but adds them
+/// to the Scene data structure which represents a set of objects to draw.
+fn add_shapes_to_scene(scene: &mut Scene) {
+    // Draw an outlined rectangle
+    let stroke = Stroke::new(6.0);
+    let rect = RoundedRect::new(4.0, 4.0, 240.0, 240.0, 20.0);
+    let rect_stroke_color = Color::new([0.9804, 0.702, 0.5294, 1.]);
+    let rect_fill_color = Color::new([0.6, 0.5, 0.3, 1.]);
+    scene.fill(
+        vello::peniko::Fill::NonZero,
+        Affine::IDENTITY,
+        rect_fill_color,
+        None,
+        &rect,
+    );
+    scene.stroke(&stroke, Affine::IDENTITY, rect_stroke_color, None, &rect);
+
+    //// Draw a filled circle
+    //let circle = Circle::new((420.0, 200.0), 120.0);
+    //let circle_fill_color = Color::new([0.9529, 0.5451, 0.6588, 1.]);
+    //scene.fill(
+    //    vello::peniko::Fill::NonZero,
+    //    Affine::IDENTITY,
+    //    circle_fill_color,
+    //    None,
+    //    &circle,
+    //);
+    //
+    //// Draw a filled ellipse
+    //let ellipse = Ellipse::new((250.0, 420.0), (100.0, 160.0), -90.0);
+    //let ellipse_fill_color = Color::new([0.7961, 0.651, 0.9686, 1.]);
+    //scene.fill(
+    //    vello::peniko::Fill::NonZero,
+    //    Affine::IDENTITY,
+    //    ellipse_fill_color,
+    //    None,
+    //    &ellipse,
+    //);
+    //
+    //// Draw a straight line
+    //let line = Line::new((260.0, 20.0), (620.0, 100.0));
+    //let line_stroke_color = Color::new([0.5373, 0.7059, 0.9804, 1.]);
+    //scene.stroke(&stroke, Affine::IDENTITY, line_stroke_color, None, &line);
 }

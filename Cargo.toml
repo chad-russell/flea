@@ -4,9 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-bytemuck = { version = "1.17.1", features = ["derive"] }
-pollster = "0.3.0"
-wgpu = "22.1.0"
-winit = "0.30.5"
-floem_reactive = "0.1.0"
-rand = "0.8.5"
+anyhow = "1.0.95"
+pollster = "0.4.0"
+winit = "0.30.7"
+vello = { git = "https://github.com/linebender/vello", rev = "8a84a4abf7aa" }
+petgraph = "0.6.5"

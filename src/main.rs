@@ -5,10 +5,6 @@
 
 use anyhow::Result;
 use petgraph::graph::{DiGraph, NodeIndex};
-use std::any::Any;
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use vello::kurbo::{Affine, Point, Rect, RoundedRect, Size, Stroke};
@@ -72,16 +68,15 @@ struct LayoutChildWasSizedCtx {
     child_size: Size,
 }
 
-struct LayouterSizeSelfCtx<'a> {
+struct LayouterSizeSelfCtx {
     constraints: Constraints,
-    dependencies: &'a mut Vec<NodeIndex>,
 }
 
 trait Layouter {
     fn callback_begin_layout(&mut self);
     fn constrain_child(&mut self, ctx: LayouterConstrainChildrenCtx) -> Constraints;
     fn child_was_sized_compute_position(&mut self, ctx: LayoutChildWasSizedCtx) -> Point;
-    fn size_self(&mut self, signal_values: &SignalValues, ctx: LayouterSizeSelfCtx) -> Size;
+    fn size_self(&mut self, ctx: LayouterSizeSelfCtx) -> Size;
     //fn callback_end_layout(&mut self);
 }
 
@@ -121,7 +116,7 @@ impl Layouter for RowLayouter {
         )
     }
 
-    fn size_self(&mut self, _signal_values: &SignalValues, _ctx: LayouterSizeSelfCtx) -> Size {
+    fn size_self(&mut self, _ctx: LayouterSizeSelfCtx) -> Size {
         println!("RowLayouter::size_self");
         self.child_sizes
             .iter()
@@ -148,28 +143,20 @@ struct WidgetTreeWeight {
     drawer: Option<Box<dyn Drawer>>,
     position: Point,
     size: Size,
-    layout_revision: Revision,
-    draw_revision: Revision,
-    layout_dependencies: Vec<NodeIndex>,
-    draw_dependencies: Vec<NodeIndex>,
 }
 
-type SignalValues = RefCell<Vec<Box<RefCell<dyn Any>>>>;
-
 struct WidgetTree {
-    t: RefCell<DiGraph<RefCell<WidgetTreeWeight>, ()>>,
+    t: DiGraph<WidgetTreeWeight, ()>,
     root: Option<NodeIndex>,
     revision: usize,
-    signal_values: SignalValues,
 }
 
 impl WidgetTree {
     pub fn new() -> Self {
         Self {
-            t: RefCell::new(DiGraph::<RefCell<WidgetTreeWeight>, ()>::new()),
+            t: DiGraph::<WidgetTreeWeight, ()>::new(),
             root: None,
             revision: 0,
-            signal_values: RefCell::new(Vec::new()),
         }
     }
 
@@ -178,22 +165,12 @@ impl WidgetTree {
         layouter: Box<dyn Layouter>,
         drawer: Option<Box<dyn Drawer>>,
     ) -> NodeIndex {
-        let idx = self.t.borrow_mut().add_node(RefCell::new(WidgetTreeWeight {
+        let idx = self.t.add_node(WidgetTreeWeight {
             layouter,
             drawer,
             position: Point::ORIGIN,
             size: Size::ZERO,
-            layout_revision: Revision {
-                last_updated: self.revision,
-                valid_through: self.revision,
-            },
-            layout_dependencies: vec![],
-            draw_revision: Revision {
-                last_updated: self.revision,
-                valid_through: self.revision,
-            },
-            draw_dependencies: vec![],
-        }));
+        });
 
         if self.root.is_none() {
             self.root = Some(idx)
@@ -209,38 +186,29 @@ impl WidgetTree {
 
     fn layout_index(&mut self, index: NodeIndex, constraints: Constraints) -> Size {
         {
-            let mut weight = self.t.borrow_mut();
-            let mut weight = weight.node_weight_mut(index).unwrap().borrow_mut();
+            let mut weight = self.t.node_weight_mut(index).unwrap();
             weight.layouter.callback_begin_layout();
         }
 
         // todo(chad): performance
         let children = self
             .t
-            .borrow()
             .neighbors_directed(index, petgraph::Direction::Outgoing)
             .collect::<Vec<_>>();
 
         for child in children {
             let child_constraints = {
-                let mut child_weight = self.t.borrow_mut();
-                let mut child_weight = child_weight.node_weight_mut(index).unwrap().borrow_mut();
+                let mut child_weight = self.t.node_weight_mut(index).unwrap();
                 child_weight
                     .layouter
                     .constrain_child(LayouterConstrainChildrenCtx { constraints })
             };
 
             let child_size = self.layout_index(child, child_constraints);
-            self.t
-                .borrow_mut()
-                .node_weight_mut(child)
-                .unwrap()
-                .borrow_mut()
-                .size = child_size;
+            self.t.node_weight_mut(child).unwrap().size = child_size;
 
             {
-                let mut child_weight = self.t.borrow_mut();
-                let mut child_weight = child_weight.node_weight_mut(index).unwrap().borrow_mut();
+                let mut child_weight = self.t.node_weight_mut(index).unwrap();
                 let child_position = child_weight
                     .layouter
                     .child_was_sized_compute_position(LayoutChildWasSizedCtx { child_size });
@@ -248,23 +216,16 @@ impl WidgetTree {
             }
         }
 
-        let mut weight = self.t.borrow_mut();
-        let mut weight = weight.node_weight_mut(index).unwrap().borrow_mut();
-        weight.layouter.size_self(
-            &self.signal_values,
-            LayouterSizeSelfCtx {
-                constraints,
-                // dependencies: &mut weight.borrow_mut().layout_dependencies,
-                dependencies: &mut Vec::new(),
-            },
-        )
+        let mut weight = self.t.node_weight_mut(index).unwrap();
+        weight
+            .layouter
+            .size_self(LayouterSizeSelfCtx { constraints })
         // Size::ZERO
     }
 
     pub fn draw_index(&mut self, index: NodeIndex, scene: &mut Scene, offset_pos: Point) {
         let position = {
-            let mut weight = self.t.borrow_mut();
-            let mut weight = weight.node_weight_mut(index).unwrap().borrow_mut();
+            let mut weight = self.t.node_weight_mut(index).unwrap();
             let position = weight.position;
             let size = weight.size;
             weight.drawer.as_mut().map(|d| {
@@ -279,7 +240,6 @@ impl WidgetTree {
         // todo(chad): performance
         let neighbors = self
             .t
-            .borrow()
             .neighbors_directed(index, petgraph::Direction::Outgoing)
             .collect::<Vec<_>>();
         for child in neighbors {
@@ -291,17 +251,6 @@ impl WidgetTree {
     pub fn draw(&mut self, scene: &mut Scene) {
         let Some(root) = self.root else { return };
         self.draw_index(root, scene, Point::ORIGIN);
-    }
-
-    fn create_signal(&self, value: Size) -> Signal<Size> {
-        let id = self.signal_values.borrow().len();
-        self.signal_values
-            .borrow_mut()
-            .push(Box::new(RefCell::new(value)));
-        Signal {
-            id: SignalId(id),
-            ty: PhantomData,
-        }
     }
 }
 
@@ -447,60 +396,12 @@ impl Drawer for SimpleQuadDrawer {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct SignalId(usize);
-
-#[derive(Clone, Copy)]
-struct Signal<T> {
-    id: SignalId,
-    ty: PhantomData<T>,
-}
-
-impl<T> Signal<T>
-where
-    T: Clone + 'static,
-{
-    fn get(&self, signal_values: &SignalValues) -> T {
-        let value = &signal_values.borrow()[self.id.0];
-        let value = value.borrow();
-        value.downcast_ref::<T>().unwrap().clone()
-    }
-}
-
-struct ReactiveSizedBoxLayouter {
-    size: Signal<Size>,
-}
-
-impl ReactiveSizedBoxLayouter {
-    fn new(tree: &mut WidgetTree, size: Size) -> Self {
-        Self {
-            size: tree.create_signal(size),
-        }
-    }
-}
-
-impl Layouter for ReactiveSizedBoxLayouter {
-    fn size_self(&mut self, signal_values: &SignalValues, _ctx: LayouterSizeSelfCtx) -> Size {
-        self.size.get(signal_values)
-    }
-
-    fn callback_begin_layout(&mut self) {}
-
-    fn constrain_child(&mut self, ctx: LayouterConstrainChildrenCtx) -> Constraints {
-        ctx.constraints
-    }
-
-    fn child_was_sized_compute_position(&mut self, _ctx: LayoutChildWasSizedCtx) -> Point {
-        Point::ORIGIN
-    }
-}
-
 struct SizedBoxLayouter {
     size: Size,
 }
 
 impl Layouter for SizedBoxLayouter {
-    fn size_self(&mut self, _signal_values: &SignalValues, _ctx: LayouterSizeSelfCtx) -> Size {
+    fn size_self(&mut self, _ctx: LayouterSizeSelfCtx) -> Size {
         self.size
     }
 
@@ -517,7 +418,6 @@ impl Layouter for SizedBoxLayouter {
 
 fn main() -> Result<()> {
     let mut widget_tree = WidgetTree::new();
-    let size_signal = widget_tree.create_signal(Size::new(100.0, 100.0));
     let root = widget_tree.add_node(
         Box::new(RowLayouter {
             child_sizes: vec![],
@@ -525,20 +425,26 @@ fn main() -> Result<()> {
         None,
     );
     let child1 = widget_tree.add_node(
-        Box::new(ReactiveSizedBoxLayouter { size: size_signal }),
+        Box::new(SizedBoxLayouter {
+            size: Size::new(100.0, 100.0),
+        }),
         Some(Box::new(SimpleQuadDrawer {})),
     );
     let child2 = widget_tree.add_node(
-        Box::new(ReactiveSizedBoxLayouter { size: size_signal }),
+        Box::new(SizedBoxLayouter {
+            size: Size::new(100.0, 100.0),
+        }),
         Some(Box::new(SimpleQuadDrawer {})),
     );
     let child3 = widget_tree.add_node(
-        Box::new(ReactiveSizedBoxLayouter { size: size_signal }),
+        Box::new(SizedBoxLayouter {
+            size: Size::new(100.0, 100.0),
+        }),
         Some(Box::new(SimpleQuadDrawer {})),
     );
-    widget_tree.t.borrow_mut().add_edge(root, child1, ());
-    widget_tree.t.borrow_mut().add_edge(root, child2, ());
-    widget_tree.t.borrow_mut().add_edge(child1, child3, ());
+    widget_tree.t.add_edge(root, child1, ());
+    widget_tree.t.add_edge(root, child2, ());
+    widget_tree.t.add_edge(child1, child3, ());
 
     let mut app = SimpleVelloApp {
         context: RenderContext::new(),
@@ -578,47 +484,47 @@ fn create_vello_renderer(render_cx: &RenderContext, surface: &RenderSurface<'_>)
     .expect("Couldn't create renderer")
 }
 
-/// Add shapes to a vello scene. This does not actually render the shapes, but adds them
-/// to the Scene data structure which represents a set of objects to draw.
-fn add_shapes_to_scene(scene: &mut Scene) {
-    // Draw an outlined rectangle
-    let stroke = Stroke::new(6.0);
-    let rect = RoundedRect::new(4.0, 4.0, 240.0, 240.0, 20.0);
-    let rect_stroke_color = Color::new([0.9804, 0.702, 0.5294, 1.]);
-    let rect_fill_color = Color::new([0.6, 0.5, 0.3, 1.]);
-    scene.fill(
-        vello::peniko::Fill::NonZero,
-        Affine::IDENTITY,
-        rect_fill_color,
-        None,
-        &rect,
-    );
-    scene.stroke(&stroke, Affine::IDENTITY, rect_stroke_color, None, &rect);
+// /// Add shapes to a vello scene. This does not actually render the shapes, but adds them
+// /// to the Scene data structure which represents a set of objects to draw.
+// fn add_shapes_to_scene(scene: &mut Scene) {
+//     // Draw an outlined rectangle
+//     let stroke = Stroke::new(6.0);
+//     let rect = RoundedRect::new(4.0, 4.0, 240.0, 240.0, 20.0);
+//     let rect_stroke_color = Color::new([0.9804, 0.702, 0.5294, 1.]);
+//     let rect_fill_color = Color::new([0.6, 0.5, 0.3, 1.]);
+//     scene.fill(
+//         vello::peniko::Fill::NonZero,
+//         Affine::IDENTITY,
+//         rect_fill_color,
+//         None,
+//         &rect,
+//     );
+//     scene.stroke(&stroke, Affine::IDENTITY, rect_stroke_color, None, &rect);
 
-    //// Draw a filled circle
-    //let circle = Circle::new((420.0, 200.0), 120.0);
-    //let circle_fill_color = Color::new([0.9529, 0.5451, 0.6588, 1.]);
-    //scene.fill(
-    //    vello::peniko::Fill::NonZero,
-    //    Affine::IDENTITY,
-    //    circle_fill_color,
-    //    None,
-    //    &circle,
-    //);
-    //
-    //// Draw a filled ellipse
-    //let ellipse = Ellipse::new((250.0, 420.0), (100.0, 160.0), -90.0);
-    //let ellipse_fill_color = Color::new([0.7961, 0.651, 0.9686, 1.]);
-    //scene.fill(
-    //    vello::peniko::Fill::NonZero,
-    //    Affine::IDENTITY,
-    //    ellipse_fill_color,
-    //    None,
-    //    &ellipse,
-    //);
-    //
-    //// Draw a straight line
-    //let line = Line::new((260.0, 20.0), (620.0, 100.0));
-    //let line_stroke_color = Color::new([0.5373, 0.7059, 0.9804, 1.]);
-    //scene.stroke(&stroke, Affine::IDENTITY, line_stroke_color, None, &line);
-}
+//     //// Draw a filled circle
+//     //let circle = Circle::new((420.0, 200.0), 120.0);
+//     //let circle_fill_color = Color::new([0.9529, 0.5451, 0.6588, 1.]);
+//     //scene.fill(
+//     //    vello::peniko::Fill::NonZero,
+//     //    Affine::IDENTITY,
+//     //    circle_fill_color,
+//     //    None,
+//     //    &circle,
+//     //);
+//     //
+//     //// Draw a filled ellipse
+//     //let ellipse = Ellipse::new((250.0, 420.0), (100.0, 160.0), -90.0);
+//     //let ellipse_fill_color = Color::new([0.7961, 0.651, 0.9686, 1.]);
+//     //scene.fill(
+//     //    vello::peniko::Fill::NonZero,
+//     //    Affine::IDENTITY,
+//     //    ellipse_fill_color,
+//     //    None,
+//     //    &ellipse,
+//     //);
+//     //
+//     //// Draw a straight line
+//     //let line = Line::new((260.0, 20.0), (620.0, 100.0));
+//     //let line_stroke_color = Color::new([0.5373, 0.7059, 0.9804, 1.]);
+//     //scene.stroke(&stroke, Affine::IDENTITY, line_stroke_color, None, &line);
+// }

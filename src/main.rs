@@ -5,7 +5,10 @@
 
 use anyhow::Result;
 use petgraph::graph::{DiGraph, NodeIndex};
+use std::any::Any;
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use vello::kurbo::{Affine, Point, Rect, RoundedRect, Size, Stroke};
@@ -69,16 +72,16 @@ struct LayoutChildWasSizedCtx {
     child_size: Size,
 }
 
-#[derive(Clone, Copy)]
-struct LayouterSizeSelfCtx {
+struct LayouterSizeSelfCtx<'a> {
     constraints: Constraints,
+    dependencies: &'a mut Vec<NodeIndex>,
 }
 
 trait Layouter {
     fn callback_begin_layout(&mut self);
     fn constrain_child(&mut self, ctx: LayouterConstrainChildrenCtx) -> Constraints;
     fn child_was_sized_compute_position(&mut self, ctx: LayoutChildWasSizedCtx) -> Point;
-    fn size_self(&mut self, ctx: LayouterSizeSelfCtx) -> Size;
+    fn size_self(&mut self, signal_values: &SignalValues, ctx: LayouterSizeSelfCtx) -> Size;
     //fn callback_end_layout(&mut self);
 }
 
@@ -118,7 +121,7 @@ impl Layouter for RowLayouter {
         )
     }
 
-    fn size_self(&mut self, _ctx: LayouterSizeSelfCtx) -> Size {
+    fn size_self(&mut self, _signal_values: &SignalValues, _ctx: LayouterSizeSelfCtx) -> Size {
         println!("RowLayouter::size_self");
         self.child_sizes
             .iter()
@@ -135,25 +138,38 @@ trait Drawer {
     fn draw(&mut self, ctx: DrawerCtx);
 }
 
+struct Revision {
+    last_updated: usize,
+    valid_through: usize,
+}
+
 struct WidgetTreeWeight {
     layouter: Box<dyn Layouter>,
     drawer: Option<Box<dyn Drawer>>,
     position: Point,
     size: Size,
+    layout_revision: Revision,
+    draw_revision: Revision,
+    layout_dependencies: Vec<NodeIndex>,
+    draw_dependencies: Vec<NodeIndex>,
 }
 
+type SignalValues = RefCell<Vec<Box<RefCell<dyn Any>>>>;
+
 struct WidgetTree {
-    t: DiGraph<WidgetTreeWeight, ()>,
+    t: RefCell<DiGraph<RefCell<WidgetTreeWeight>, ()>>,
     root: Option<NodeIndex>,
-    dependencies: HashMap<NodeIndex, Vec<NodeIndex>>,
+    revision: usize,
+    signal_values: SignalValues,
 }
 
 impl WidgetTree {
     pub fn new() -> Self {
         Self {
-            t: DiGraph::<WidgetTreeWeight, ()>::new(),
+            t: RefCell::new(DiGraph::<RefCell<WidgetTreeWeight>, ()>::new()),
             root: None,
-            dependencies: HashMap::new(),
+            revision: 0,
+            signal_values: RefCell::new(Vec::new()),
         }
     }
 
@@ -162,12 +178,22 @@ impl WidgetTree {
         layouter: Box<dyn Layouter>,
         drawer: Option<Box<dyn Drawer>>,
     ) -> NodeIndex {
-        let idx = self.t.add_node(WidgetTreeWeight {
+        let idx = self.t.borrow_mut().add_node(RefCell::new(WidgetTreeWeight {
             layouter,
             drawer,
             position: Point::ORIGIN,
             size: Size::ZERO,
-        });
+            layout_revision: Revision {
+                last_updated: self.revision,
+                valid_through: self.revision,
+            },
+            layout_dependencies: vec![],
+            draw_revision: Revision {
+                last_updated: self.revision,
+                valid_through: self.revision,
+            },
+            draw_dependencies: vec![],
+        }));
 
         if self.root.is_none() {
             self.root = Some(idx)
@@ -183,59 +209,77 @@ impl WidgetTree {
 
     fn layout_index(&mut self, index: NodeIndex, constraints: Constraints) -> Size {
         {
-            let WidgetTreeWeight { layouter, .. } = self.t.node_weight_mut(index).unwrap();
-            layouter.callback_begin_layout();
+            let mut weight = self.t.borrow_mut();
+            let mut weight = weight.node_weight_mut(index).unwrap().borrow_mut();
+            weight.layouter.callback_begin_layout();
         }
 
         // todo(chad): performance
         let children = self
             .t
+            .borrow()
             .neighbors_directed(index, petgraph::Direction::Outgoing)
             .collect::<Vec<_>>();
 
-        // constraints flow down, sizes flow up
         for child in children {
-            // todo(chad): performance
             let child_constraints = {
-                let WidgetTreeWeight { layouter, .. } = self.t.node_weight_mut(index).unwrap();
-                layouter.constrain_child(LayouterConstrainChildrenCtx { constraints })
+                let mut child_weight = self.t.borrow_mut();
+                let mut child_weight = child_weight.node_weight_mut(index).unwrap().borrow_mut();
+                child_weight
+                    .layouter
+                    .constrain_child(LayouterConstrainChildrenCtx { constraints })
             };
 
             let child_size = self.layout_index(child, child_constraints);
-            self.t.node_weight_mut(child).unwrap().size = child_size;
+            self.t
+                .borrow_mut()
+                .node_weight_mut(child)
+                .unwrap()
+                .borrow_mut()
+                .size = child_size;
 
             {
-                let WidgetTreeWeight { layouter, .. } = self.t.node_weight_mut(index).unwrap();
-                let child_position = layouter
+                let mut child_weight = self.t.borrow_mut();
+                let mut child_weight = child_weight.node_weight_mut(index).unwrap().borrow_mut();
+                let child_position = child_weight
+                    .layouter
                     .child_was_sized_compute_position(LayoutChildWasSizedCtx { child_size });
-                self.t.node_weight_mut(child).unwrap().position = child_position;
+                child_weight.position = child_position;
             }
         }
 
-        let WidgetTreeWeight { layouter, .. } = self.t.node_weight_mut(index).unwrap();
-        layouter.size_self(LayouterSizeSelfCtx { constraints })
+        let mut weight = self.t.borrow_mut();
+        let mut weight = weight.node_weight_mut(index).unwrap().borrow_mut();
+        weight.layouter.size_self(
+            &self.signal_values,
+            LayouterSizeSelfCtx {
+                constraints,
+                // dependencies: &mut weight.borrow_mut().layout_dependencies,
+                dependencies: &mut Vec::new(),
+            },
+        )
+        // Size::ZERO
     }
 
     pub fn draw_index(&mut self, index: NodeIndex, scene: &mut Scene, offset_pos: Point) {
-        let WidgetTreeWeight {
-            drawer,
-            position,
-            size,
-            ..
-        } = self.t.node_weight_mut(index).unwrap();
-        let position = *position;
-        let size = *size;
-
-        if let Some(drawer) = drawer {
-            drawer.draw(DrawerCtx {
-                scene,
-                rect: Rect::from_origin_size(position, size),
+        let position = {
+            let mut weight = self.t.borrow_mut();
+            let mut weight = weight.node_weight_mut(index).unwrap().borrow_mut();
+            let position = weight.position;
+            let size = weight.size;
+            weight.drawer.as_mut().map(|d| {
+                d.draw(DrawerCtx {
+                    scene,
+                    rect: Rect::from_origin_size(position, size),
+                });
             });
-        }
+            position
+        };
 
         // todo(chad): performance
         let neighbors = self
             .t
+            .borrow()
             .neighbors_directed(index, petgraph::Direction::Outgoing)
             .collect::<Vec<_>>();
         for child in neighbors {
@@ -247,6 +291,17 @@ impl WidgetTree {
     pub fn draw(&mut self, scene: &mut Scene) {
         let Some(root) = self.root else { return };
         self.draw_index(root, scene, Point::ORIGIN);
+    }
+
+    fn create_signal(&self, value: Size) -> Signal<Size> {
+        let id = self.signal_values.borrow().len();
+        self.signal_values
+            .borrow_mut()
+            .push(Box::new(RefCell::new(value)));
+        Signal {
+            id: SignalId(id),
+            ty: PhantomData,
+        }
     }
 }
 
@@ -392,22 +447,23 @@ impl Drawer for SimpleQuadDrawer {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct SignalId(usize);
+
 #[derive(Clone, Copy)]
 struct Signal<T> {
-    value: T,
+    id: SignalId,
+    ty: PhantomData<T>,
 }
 
-impl<T> Signal<T> {
-    fn track(&self) {}
-
-    fn get(&self) -> &T {
-        self.track();
-        &self.value
-    }
-
-    fn get_mut(&self) -> &T {
-        self.track();
-        &self.value
+impl<T> Signal<T>
+where
+    T: Clone + 'static,
+{
+    fn get(&self, signal_values: &SignalValues) -> T {
+        let value = &signal_values.borrow()[self.id.0];
+        let value = value.borrow();
+        value.downcast_ref::<T>().unwrap().clone()
     }
 }
 
@@ -416,18 +472,16 @@ struct ReactiveSizedBoxLayouter {
 }
 
 impl ReactiveSizedBoxLayouter {
-    fn new() -> Self {
+    fn new(tree: &mut WidgetTree, size: Size) -> Self {
         Self {
-            size: Signal {
-                value: Size::new(100.0, 100.0),
-            },
+            size: tree.create_signal(size),
         }
     }
 }
 
 impl Layouter for ReactiveSizedBoxLayouter {
-    fn size_self(&mut self, _ctx: LayouterSizeSelfCtx) -> Size {
-        *self.size.get()
+    fn size_self(&mut self, signal_values: &SignalValues, _ctx: LayouterSizeSelfCtx) -> Size {
+        self.size.get(signal_values)
     }
 
     fn callback_begin_layout(&mut self) {}
@@ -436,7 +490,7 @@ impl Layouter for ReactiveSizedBoxLayouter {
         ctx.constraints
     }
 
-    fn child_was_sized_compute_position(&mut self, ctx: LayoutChildWasSizedCtx) -> Point {
+    fn child_was_sized_compute_position(&mut self, _ctx: LayoutChildWasSizedCtx) -> Point {
         Point::ORIGIN
     }
 }
@@ -446,7 +500,7 @@ struct SizedBoxLayouter {
 }
 
 impl Layouter for SizedBoxLayouter {
-    fn size_self(&mut self, _ctx: LayouterSizeSelfCtx) -> Size {
+    fn size_self(&mut self, _signal_values: &SignalValues, _ctx: LayouterSizeSelfCtx) -> Size {
         self.size
     }
 
@@ -456,17 +510,14 @@ impl Layouter for SizedBoxLayouter {
         ctx.constraints
     }
 
-    fn child_was_sized_compute_position(&mut self, ctx: LayoutChildWasSizedCtx) -> Point {
+    fn child_was_sized_compute_position(&mut self, _ctx: LayoutChildWasSizedCtx) -> Point {
         Point::ORIGIN
     }
 }
 
 fn main() -> Result<()> {
-    let size_signal = Signal {
-        value: Size::new(100.0, 100.0),
-    };
-
     let mut widget_tree = WidgetTree::new();
+    let size_signal = widget_tree.create_signal(Size::new(100.0, 100.0));
     let root = widget_tree.add_node(
         Box::new(RowLayouter {
             child_sizes: vec![],
@@ -485,9 +536,9 @@ fn main() -> Result<()> {
         Box::new(ReactiveSizedBoxLayouter { size: size_signal }),
         Some(Box::new(SimpleQuadDrawer {})),
     );
-    widget_tree.t.add_edge(root, child1, ());
-    widget_tree.t.add_edge(root, child2, ());
-    widget_tree.t.add_edge(child1, child3, ());
+    widget_tree.t.borrow_mut().add_edge(root, child1, ());
+    widget_tree.t.borrow_mut().add_edge(root, child2, ());
+    widget_tree.t.borrow_mut().add_edge(child1, child3, ());
 
     let mut app = SimpleVelloApp {
         context: RenderContext::new(),

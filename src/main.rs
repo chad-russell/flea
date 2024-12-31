@@ -135,8 +135,6 @@ impl Layouter for RowLayouter {
         index: NodeIndex,
         ctx: LayoutChildWasSizedCtx,
     ) -> Point {
-        println!("computing position for child.....");
-
         if ctx.child_n == 0 {
             return Point::ORIGIN;
         }
@@ -153,11 +151,6 @@ impl Layouter for RowLayouter {
         let prev_child_position = tree.get_cached_query_or_compute(NodePosition {
             index: prev_child_index,
         });
-
-        println!(
-            "prev child -- index: {:?}, position: {:?}, size: {:?}",
-            prev_child_index, prev_child_position, prev_child_size
-        );
 
         Point::new(
             prev_child_position.x + prev_child_size.width,
@@ -197,6 +190,83 @@ impl Layouter for RowLayouter {
     }
 }
 
+struct Padded {
+    top: f64,
+    bottom: f64,
+    left: f64,
+    right: f64,
+}
+
+impl Padded {
+    fn uniform(p: f64) -> Self {
+        return Padded {
+            top: p,
+            bottom: p,
+            left: p,
+            right: p,
+        };
+    }
+
+    fn symmetric(vertical: f64, horizontal: f64) -> Self {
+        return Padded {
+            top: vertical,
+            bottom: vertical,
+            left: horizontal,
+            right: horizontal,
+        };
+    }
+}
+
+impl Layouter for Padded {
+    fn constraints_for_child(
+        &self,
+        tree: &'static WidgetTree,
+        index: NodeIndex,
+        ctx: LayouterConstrainChildrenCtx,
+    ) -> Constraints {
+        Constraints {
+            min: ctx.self_constraints.min,
+            max: Size {
+                width: ctx.self_constraints.max.width - self.left - self.right,
+                height: ctx.self_constraints.max.height - self.top - self.bottom,
+            },
+        }
+    }
+
+    fn position_for_child(
+        &self,
+        tree: &'static WidgetTree,
+        index: NodeIndex,
+        ctx: LayoutChildWasSizedCtx,
+    ) -> Point {
+        Point {
+            x: self.left,
+            y: self.top,
+        }
+    }
+
+    fn size_for_self(
+        &self,
+        tree: &'static WidgetTree,
+        index: NodeIndex,
+        _ctx: LayouterSizeSelfCtx,
+    ) -> Size {
+        // todo(chad): compute largest child. For now, just assume one child and comput 0th child
+        // OR, we can assert that this widget only has one child
+        let first_child = tree.get_cached_query_or_compute(NthChild {
+            parent_index: index,
+            child_n: 0,
+        });
+
+        let first_child_size = tree.get_cached_query_or_compute(NodeSize { index: first_child });
+
+        Size {
+            width: first_child_size.width + self.left + self.right,
+            height: first_child_size.height + self.top + self.bottom,
+        }
+    }
+}
+
 struct DrawerCtx<'a> {
     rect: Rect,
     scene: &'a mut Scene,
@@ -231,9 +301,7 @@ impl QueryKey for NodePosition {
     type Output = Point;
 
     fn execute(&self, tree: &'static WidgetTree) -> Self::Output {
-        println!("node positon for {:?}", self);
-
-        if self.index == tree.root.unwrap() {
+        if self.index == tree.root.borrow().unwrap() {
             return Point::ORIGIN;
         }
 
@@ -270,7 +338,7 @@ impl QueryKey for NodeConstraints {
     type Output = Constraints;
 
     fn execute(&self, tree: &'static WidgetTree) -> Self::Output {
-        if self.index == tree.root.unwrap() {
+        if self.index == tree.root.borrow().unwrap() {
             return Constraints {
                 min: Size::ZERO,
                 max: tree.size.borrow().clone(),
@@ -364,7 +432,7 @@ struct DebugContext {
 struct WidgetTree {
     size: RefCell<Size>,
     tree: RefCell<DiGraph<WidgetTreeWeight, ()>>,
-    root: Option<NodeIndex>,
+    root: RefCell<Option<NodeIndex>>,
     // revision: usize,
     // where here the Box<dyn Any> is a hashmap from input type to CachedQueryOutput for that input type
     query_cache: RefCell<HashMap<TypeId, Box<dyn Any>>>,
@@ -376,7 +444,7 @@ impl WidgetTree {
         Self {
             size: RefCell::new(Size::ZERO),
             tree: RefCell::new(DiGraph::<WidgetTreeWeight, ()>::new()),
-            root: None,
+            root: RefCell::new(None),
             // revision: 0,
             query_cache: RefCell::new(HashMap::new()),
             debug_context: RefCell::new(DebugContext::default()),
@@ -384,7 +452,7 @@ impl WidgetTree {
     }
 
     pub fn add_node(
-        &mut self,
+        &'static self,
         layouter: Box<dyn Layouter>,
         drawer: Option<Box<dyn Drawer>>,
     ) -> NodeIndex {
@@ -393,11 +461,41 @@ impl WidgetTree {
             .borrow_mut()
             .add_node(WidgetTreeWeight { layouter, drawer });
 
-        if self.root.is_none() {
-            self.root = Some(idx)
+        if self.root.borrow().is_none() {
+            *self.root.borrow_mut() = Some(idx)
         }
 
         idx
+    }
+
+    pub fn add_child(
+        &'static self,
+        parent_index: impl IntoNodeIndex,
+        child_index: impl IntoNodeIndex,
+    ) -> NodeIndex {
+        let parent_index = parent_index.into(self);
+        let child_index = child_index.into(self);
+
+        self.tree
+            .borrow_mut()
+            .add_edge(parent_index, child_index, ());
+
+        child_index
+    }
+
+    pub fn add_child_index(
+        &'static self,
+        parent_index: impl IntoNodeIndex,
+        child_index: impl IntoNodeIndex,
+    ) -> NodeIndex {
+        let child_index = child_index.into(self);
+        let parent_index = parent_index.into(self);
+
+        self.tree
+            .borrow_mut()
+            .add_edge(parent_index, child_index, ());
+
+        parent_index
     }
 
     pub fn draw_index(&'static self, index: NodeIndex, scene: &mut Scene, offset_pos: Point) {
@@ -405,14 +503,19 @@ impl WidgetTree {
             let weight = self.tree.borrow();
             let weight = weight.node_weight(index).unwrap();
 
-            let position: Point = self.get_cached_query_or_compute(NodePosition { index });
+            let mut position: Point = self.get_cached_query_or_compute(NodePosition { index });
+            position.x += offset_pos.x;
+            position.y += offset_pos.y;
+
             let size: Size = self.get_cached_query_or_compute(NodeSize { index });
+
             weight.drawer.as_ref().map(|d| {
                 d.draw(DrawerCtx {
                     scene,
                     rect: Rect::from_origin_size(position, size),
                 });
             });
+
             position
         };
 
@@ -429,7 +532,9 @@ impl WidgetTree {
     }
 
     pub fn draw(&'static self, scene: &mut Scene) {
-        let Some(root) = self.root else { return };
+        let Some(root) = *self.root.borrow() else {
+            return;
+        };
         self.draw_index(root, scene, Point::ORIGIN);
     }
 
@@ -437,18 +542,18 @@ impl WidgetTree {
         &'static self,
         input: I,
     ) -> <I as QueryKey>::Output {
-        // println!(
-        //     "{}Computing {:?}",
-        //     "  ".repeat(self.debug_context.borrow().indent),
-        //     input
-        // );
+        println!(
+            "{}Computing {:?}",
+            "  ".repeat(self.debug_context.borrow().indent),
+            input
+        );
 
         if let Some(cached_output) = self.get_cached_query(&input) {
-            // println!(
-            //     "{}Result {:?}",
-            //     "  ".repeat(self.debug_context.borrow().indent),
-            //     &cached_output
-            // );
+            println!(
+                "{}Result {:?}",
+                "  ".repeat(self.debug_context.borrow().indent),
+                &cached_output
+            );
             return cached_output;
         }
 
@@ -458,11 +563,11 @@ impl WidgetTree {
         self.cache_query(input, output.clone());
 
         self.debug_context.borrow_mut().indent -= 1;
-        // println!(
-        //     "{}Result {:?}",
-        //     "  ".repeat(self.debug_context.borrow().indent),
-        //     output.clone()
-        // );
+        println!(
+            "{}Result {:?}",
+            "  ".repeat(self.debug_context.borrow().indent),
+            output.clone()
+        );
 
         output.clone()
     }
@@ -486,6 +591,28 @@ impl WidgetTree {
         let qc = qc.get(&type_id)?;
         let qc = qc.downcast_ref::<HashMap<I, O>>()?;
         qc.get(input).cloned()
+    }
+}
+
+trait IntoNodeIndex {
+    fn into(self, widget_tree: &'static WidgetTree) -> NodeIndex;
+}
+
+impl IntoNodeIndex for NodeIndex {
+    fn into(self, _widget_tree: &'static WidgetTree) -> NodeIndex {
+        self
+    }
+}
+
+impl<L: Layouter + 'static> IntoNodeIndex for L {
+    fn into(self, widget_tree: &'static WidgetTree) -> NodeIndex {
+        widget_tree.add_node(Box::new(self), None)
+    }
+}
+
+impl<L: Layouter + 'static, D: Drawer + 'static> IntoNodeIndex for (L, D) {
+    fn into(self, widget_tree: &'static WidgetTree) -> NodeIndex {
+        widget_tree.add_node(Box::new(self.0), Some(Box::new(self.1)))
     }
 }
 
@@ -566,13 +693,8 @@ impl ApplicationHandler for SimpleVelloApp<'_> {
                 // Get the RenderSurface (surface + config)
                 let surface = &render_state.surface;
 
-                // Re-add the objects to draw to the scene.
-                // add_shapes_to_scene(&mut self.scene);
-                // self.widget_tree.layout(Constraints {
-                //     min: Size::new(0.0, 0.0),
-                //     max: Size::new(surface.config.width as f64, surface.config.height as f64),
-                // });
                 self.widget_tree.draw(&mut self.scene);
+                println!("===================");
 
                 // Get the window size
                 let width = surface.config.width;
@@ -615,15 +737,20 @@ impl ApplicationHandler for SimpleVelloApp<'_> {
     }
 }
 
-struct SimpleQuadDrawer {}
+struct SimpleQuadDrawer {
+    color: [f32; 3],
+}
 
 impl Drawer for SimpleQuadDrawer {
     fn draw(&self, ctx: DrawerCtx) {
+        let [r, g, b] = self.color;
+        let [dr, dg, db] = [(r + 1.0) / 2.0, (g + 1.0) / 2.0, (b + 1.0) / 2.0];
+
         // Draw an outlined rectangle
         let stroke = Stroke::new(6.0);
         let rect = RoundedRect::new(ctx.rect.x0, ctx.rect.y0, ctx.rect.x1, ctx.rect.y1, 20.0);
-        let rect_stroke_color = Color::new([0.9804, 0.702, 0.5294, 1.]);
-        let rect_fill_color = Color::new([0.6, 0.5, 0.3, 1.]);
+        let rect_stroke_color = Color::new([dr, dg, db, 1.]);
+        let rect_fill_color = Color::new([r, g, b, 1.]);
         ctx.scene.fill(
             vello::peniko::Fill::NonZero,
             Affine::IDENTITY,
@@ -669,32 +796,65 @@ impl Layouter for SizedBoxLayouter {
     }
 }
 
-fn main() -> Result<()> {
-    let mut widget_tree = WidgetTree::new();
-    let root = widget_tree.add_node(Box::new(RowLayouter {}), None);
-    let child1 = widget_tree.add_node(
-        Box::new(SizedBoxLayouter {
-            size: Size::new(100.0, 100.0),
-        }),
-        Some(Box::new(SimpleQuadDrawer {})),
-    );
-    let child2 = widget_tree.add_node(
-        Box::new(SizedBoxLayouter {
-            size: Size::new(100.0, 100.0),
-        }),
-        Some(Box::new(SimpleQuadDrawer {})),
-    );
-    let child3 = widget_tree.add_node(
-        Box::new(SizedBoxLayouter {
-            size: Size::new(100.0, 100.0),
-        }),
-        Some(Box::new(SimpleQuadDrawer {})),
-    );
-    widget_tree.tree.borrow_mut().add_edge(root, child1, ());
-    widget_tree.tree.borrow_mut().add_edge(root, child2, ());
-    widget_tree.tree.borrow_mut().add_edge(root, child3, ());
+// fn padded(widget_tree: &'static WidgetTree, child_index: NodeIndex, p: Padded) -> NodeIndex {
+//     let parent_index = widget_tree.add_node(Box::new(p), None);
+//     widget_tree
+//         .tree
+//         .borrow_mut()
+//         .add_edge(parent_index, child_index, ());
+//     parent_index
+// }
 
+fn padded(
+    widget_tree: &'static WidgetTree,
+    child: impl IntoNodeIndex,
+    p: Padded,
+) -> impl IntoNodeIndex {
+    widget_tree.add_child_index(p, child)
+}
+
+fn main() -> Result<()> {
+    let widget_tree = WidgetTree::new();
     let widget_tree = Box::leak(Box::new(widget_tree));
+
+    let root = widget_tree.add_node(Box::new(RowLayouter {}), None);
+    widget_tree.add_child(
+        root,
+        padded(
+            widget_tree,
+            (
+                SizedBoxLayouter {
+                    size: Size::new(100.0, 100.0),
+                },
+                SimpleQuadDrawer {
+                    color: [0.6, 0.5, 0.4],
+                },
+            ),
+            Padded::uniform(15.0),
+        ),
+    );
+    widget_tree.add_child(
+        root,
+        (
+            SizedBoxLayouter {
+                size: Size::new(100.0, 100.0),
+            },
+            SimpleQuadDrawer {
+                color: [0.6, 0.5, 0.4],
+            },
+        ),
+    );
+    widget_tree.add_child(
+        root,
+        (
+            SizedBoxLayouter {
+                size: Size::new(100.0, 100.0),
+            },
+            SimpleQuadDrawer {
+                color: [0.6, 0.5, 0.4],
+            },
+        ),
+    );
 
     let mut app = SimpleVelloApp {
         context: RenderContext::new(),
@@ -734,48 +894,3 @@ fn create_vello_renderer(render_cx: &RenderContext, surface: &RenderSurface<'_>)
     )
     .expect("Couldn't create renderer")
 }
-
-// /// Add shapes to a vello scene. This does not actually render the shapes, but adds them
-// /// to the Scene data structure which represents a set of objects to draw.
-// fn add_shapes_to_scene(scene: &mut Scene) {
-//     // Draw an outlined rectangle
-//     let stroke = Stroke::new(6.0);
-//     let rect = RoundedRect::new(4.0, 4.0, 240.0, 240.0, 20.0);
-//     let rect_stroke_color = Color::new([0.9804, 0.702, 0.5294, 1.]);
-//     let rect_fill_color = Color::new([0.6, 0.5, 0.3, 1.]);
-//     scene.fill(
-//         vello::peniko::Fill::NonZero,
-//         Affine::IDENTITY,
-//         rect_fill_color,
-//         None,
-//         &rect,
-//     );
-//     scene.stroke(&stroke, Affine::IDENTITY, rect_stroke_color, None, &rect);
-
-//     //// Draw a filled circle
-//     //let circle = Circle::new((420.0, 200.0), 120.0);
-//     //let circle_fill_color = Color::new([0.9529, 0.5451, 0.6588, 1.]);
-//     //scene.fill(
-//     //    vello::peniko::Fill::NonZero,
-//     //    Affine::IDENTITY,
-//     //    circle_fill_color,
-//     //    None,
-//     //    &circle,
-//     //);
-//     //
-//     //// Draw a filled ellipse
-//     //let ellipse = Ellipse::new((250.0, 420.0), (100.0, 160.0), -90.0);
-//     //let ellipse_fill_color = Color::new([0.7961, 0.651, 0.9686, 1.]);
-//     //scene.fill(
-//     //    vello::peniko::Fill::NonZero,
-//     //    Affine::IDENTITY,
-//     //    ellipse_fill_color,
-//     //    None,
-//     //    &ellipse,
-//     //);
-//     //
-//     //// Draw a straight line
-//     //let line = Line::new((260.0, 20.0), (620.0, 100.0));
-//     //let line_stroke_color = Color::new([0.5373, 0.7059, 0.9804, 1.]);
-//     //scene.stroke(&stroke, Affine::IDENTITY, line_stroke_color, None, &line);
-// }

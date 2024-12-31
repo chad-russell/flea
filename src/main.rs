@@ -1,10 +1,8 @@
-// Copyright 2024 the Vello Authors
-// SPDX-License-Identifier: Apache-2.0 OR MIT
-
-//! Simple example.
-
 use anyhow::Result;
 use petgraph::graph::{DiGraph, NodeIndex};
+use std::any::{Any, TypeId};
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use vello::kurbo::{Affine, Point, Rect, RoundedRect, Size, Stroke};
@@ -19,108 +17,177 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::Window;
 
-/// Simple struct to hold the state of the renderer
 #[derive(Debug)]
 pub struct ActiveRenderState<'s> {
-    // The fields MUST be in this order, so that the surface is dropped before the window
     surface: RenderSurface<'s>,
     window: Arc<Window>,
 }
 
 enum RenderState<'s> {
     Active(ActiveRenderState<'s>),
-    // Cache a window so that it can be reused when the app is resumed after being suspended
     Suspended(Option<Arc<Window>>),
 }
 
 struct SimpleVelloApp<'s> {
-    // The vello RenderContext which is a global context that lasts for the
-    // lifetime of the application
     context: RenderContext,
-
-    // An array of renderers, one per wgpu device
     renderers: Vec<Option<Renderer>>,
-
-    // State for our example where we store the winit Window and the wgpu Surface
     state: RenderState<'s>,
-
-    // A vello Scene which is a data structure which allows one to build up a
-    // description a scene to be drawn (with paths, fills, images, text, etc)
-    // which is then passed to a renderer for rendering
     scene: Scene,
-
-    widget_tree: WidgetTree,
+    widget_tree: &'static WidgetTree,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct Constraints {
     min: Size,
     max: Size,
 }
 
-#[derive(Clone, Copy)]
+impl std::hash::Hash for Constraints {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.min.width.to_bits().hash(state);
+        self.min.height.to_bits().hash(state);
+        self.max.width.to_bits().hash(state);
+        self.max.height.to_bits().hash(state);
+    }
+}
+
+impl std::cmp::Eq for Constraints {}
+
+#[derive(Clone, Copy, Hash, Debug, PartialEq, Eq)]
 struct LayouterConstrainChildrenCtx {
+    child_n: usize,
     constraints: Constraints,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Hash, Debug, PartialEq)]
 struct LayoutChildWasSizedCtx {
-    child_size: Size,
+    child_n: usize,
 }
+
+impl std::cmp::Eq for LayoutChildWasSizedCtx {}
 
 struct LayouterSizeSelfCtx {
     constraints: Constraints,
 }
 
 trait Layouter {
-    fn callback_begin_layout(&mut self);
-    fn constrain_child(&mut self, ctx: LayouterConstrainChildrenCtx) -> Constraints;
-    fn child_was_sized_compute_position(&mut self, ctx: LayoutChildWasSizedCtx) -> Point;
-    fn size_self(&mut self, ctx: LayouterSizeSelfCtx) -> Size;
-    //fn callback_end_layout(&mut self);
+    fn constrain_child(
+        &self,
+        tree: &'static WidgetTree,
+        index: NodeIndex,
+        ctx: LayouterConstrainChildrenCtx,
+    ) -> Constraints;
+    fn child_was_sized_compute_position(
+        &self,
+        tree: &'static WidgetTree,
+        index: NodeIndex,
+        ctx: LayoutChildWasSizedCtx,
+    ) -> Point;
+    fn size_self(
+        &self,
+        tree: &'static WidgetTree,
+        index: NodeIndex,
+        ctx: LayouterSizeSelfCtx,
+    ) -> Size;
 }
 
-struct RowLayouter {
-    child_sizes: Vec<Size>,
-}
+struct RowLayouter {}
 
 impl Layouter for RowLayouter {
-    fn callback_begin_layout(&mut self) {
-        println!("RowLayouter::callback_begin_layout");
-        self.child_sizes.clear();
-    }
+    fn constrain_child(
+        &self,
+        tree: &'static WidgetTree,
+        index: NodeIndex,
+        ctx: LayouterConstrainChildrenCtx,
+    ) -> Constraints {
+        if ctx.child_n == 0 {
+            return ctx.constraints;
+        }
 
-    fn constrain_child(&mut self, ctx: LayouterConstrainChildrenCtx) -> Constraints {
-        println!("RowLayouter::constrain_child");
+        let prev_child_index = tree.get_cached_query_or_compute(NthChild {
+            parent_index: index,
+            child_n: ctx.child_n - 1,
+        });
+
+        let prev_child_size = tree.get_cached_query_or_compute(NodeSize {
+            index: prev_child_index,
+        });
+
+        let prev_child_position = tree.get_cached_query_or_compute(NodePosition {
+            index: prev_child_index,
+        });
+        println!("prev child position: {:?}", prev_child_position);
+
+        let remaining_width =
+            ctx.constraints.max.width - prev_child_position.x - prev_child_size.width;
+
         Constraints {
             min: ctx.constraints.min,
             max: Size {
-                width: ctx.constraints.max.width
-                    - self
-                        .child_sizes
-                        .iter()
-                        .fold(0.0, |acc, size| acc + size.width),
+                width: remaining_width,
                 height: ctx.constraints.max.height,
             },
         }
     }
 
-    fn child_was_sized_compute_position(&mut self, ctx: LayoutChildWasSizedCtx) -> Point {
-        println!("RowLayouter::child_was_sized: {:?}", ctx.child_size);
-        self.child_sizes.push(ctx.child_size);
+    fn child_was_sized_compute_position(
+        &self,
+        tree: &'static WidgetTree,
+        index: NodeIndex,
+        ctx: LayoutChildWasSizedCtx,
+    ) -> Point {
+        if ctx.child_n == 0 {
+            return Point::ORIGIN;
+        }
+
+        let prev_child_index = tree.get_cached_query_or_compute(NthChild {
+            parent_index: index,
+            child_n: ctx.child_n,
+        });
+
+        let prev_child_size = tree.get_cached_query_or_compute(NodeSize {
+            index: prev_child_index,
+        });
+
+        let prev_child_position = tree.get_cached_query_or_compute(NodePosition {
+            index: prev_child_index,
+        });
+
         Point::new(
-            self.child_sizes
-                .iter()
-                .fold(0.0, |acc, size| acc + size.width),
-            0.0,
+            prev_child_position.x + prev_child_size.width,
+            prev_child_position.y,
         )
     }
 
-    fn size_self(&mut self, _ctx: LayouterSizeSelfCtx) -> Size {
-        println!("RowLayouter::size_self");
-        self.child_sizes
-            .iter()
-            .fold(Size::new(0.0, 0.0), |acc, size| acc + *size)
+    fn size_self(
+        &self,
+        tree: &'static WidgetTree,
+        index: NodeIndex,
+        ctx: LayouterSizeSelfCtx,
+    ) -> Size {
+        let child_indices = tree
+            .tree
+            .borrow()
+            .neighbors_directed(index, petgraph::Direction::Outgoing)
+            .collect::<Vec<_>>();
+        let last_child_index = *child_indices.last().unwrap();
+
+        let last_child_x = tree
+            .get_cached_query_or_compute(NodePosition {
+                index: last_child_index,
+            })
+            .x;
+
+        let last_child_width = tree
+            .get_cached_query_or_compute(NodeSize {
+                index: last_child_index,
+            })
+            .width;
+
+        return Size {
+            width: last_child_x + last_child_width,
+            height: ctx.constraints.max.height, // todo(chad): only need to be as tall as our tallest child
+        };
     }
 }
 
@@ -130,33 +197,181 @@ struct DrawerCtx<'a> {
 }
 
 trait Drawer {
-    fn draw(&mut self, ctx: DrawerCtx);
+    fn draw(&self, ctx: DrawerCtx);
 }
 
-struct Revision {
-    last_updated: usize,
-    valid_through: usize,
-}
+// struct Revision {
+//     last_updated: usize,
+//     valid_through: usize,
+// }
 
 struct WidgetTreeWeight {
     layouter: Box<dyn Layouter>,
     drawer: Option<Box<dyn Drawer>>,
-    position: Point,
-    size: Size,
+}
+
+trait QueryKey: Clone + std::hash::Hash + std::fmt::Debug + PartialEq + Eq {
+    type Output: Clone + std::fmt::Debug;
+
+    fn execute(&self, tree: &'static WidgetTree) -> Self::Output;
+}
+
+#[derive(Clone, Copy, Hash, Debug, PartialEq, Eq)]
+struct NodePosition {
+    index: NodeIndex,
+}
+
+impl QueryKey for NodePosition {
+    type Output = Point;
+
+    fn execute(&self, tree: &'static WidgetTree) -> Self::Output {
+        if self.index == tree.root.unwrap() {
+            return Point::ORIGIN;
+        }
+
+        let parent = tree
+            .tree
+            .borrow()
+            .neighbors_directed(self.index, petgraph::Direction::Incoming)
+            .next()
+            .unwrap();
+
+        // todo(chad): performance
+        let child_n = tree
+            .tree
+            .borrow()
+            .neighbors_directed(parent, petgraph::Direction::Outgoing)
+            .position(|n| n == self.index)
+            .unwrap();
+
+        tree.tree
+            .borrow()
+            .node_weight(self.index)
+            .unwrap()
+            .layouter
+            .child_was_sized_compute_position(tree, self.index, LayoutChildWasSizedCtx { child_n })
+    }
+}
+
+#[derive(Clone, Copy, Hash, Debug, PartialEq, Eq)]
+struct NodeConstraints {
+    index: NodeIndex,
+}
+
+impl QueryKey for NodeConstraints {
+    type Output = Constraints;
+
+    fn execute(&self, tree: &'static WidgetTree) -> Self::Output {
+        if self.index == tree.root.unwrap() {
+            return Constraints {
+                min: Size::ZERO,
+                max: tree.size.borrow().clone(),
+            };
+        }
+
+        let parent = tree
+            .tree
+            .borrow()
+            .neighbors_directed(self.index, petgraph::Direction::Incoming)
+            .next()
+            .unwrap();
+
+        let parent_constraints =
+            tree.get_cached_query_or_compute(NodeConstraints { index: parent });
+
+        // todo(chad): performance
+        let child_n = tree
+            .tree
+            .borrow()
+            .neighbors_directed(parent, petgraph::Direction::Outgoing)
+            .position(|n| n == self.index)
+            .unwrap();
+
+        tree.tree
+            .borrow()
+            .node_weight(parent)
+            .unwrap()
+            .layouter
+            .constrain_child(
+                tree,
+                parent,
+                LayouterConstrainChildrenCtx {
+                    child_n,
+                    constraints: parent_constraints,
+                },
+            )
+    }
+}
+
+#[derive(Clone, Copy, Hash, Debug, PartialEq, Eq)]
+struct NodeSize {
+    index: NodeIndex,
+}
+
+impl QueryKey for NodeSize {
+    type Output = Size;
+
+    fn execute(&self, tree: &'static WidgetTree) -> Self::Output {
+        let constraints = tree.get_cached_query_or_compute(NodeConstraints { index: self.index });
+        tree.tree
+            .borrow()
+            .node_weight(self.index)
+            .unwrap()
+            .layouter
+            .size_self(tree, self.index, LayouterSizeSelfCtx { constraints })
+    }
+}
+
+#[derive(Clone, Copy, Hash, Debug, PartialEq, Eq)]
+struct NthChild {
+    parent_index: NodeIndex,
+    child_n: usize,
+}
+
+impl QueryKey for NthChild {
+    type Output = NodeIndex;
+
+    fn execute(&self, tree: &'static WidgetTree) -> Self::Output {
+        let result = tree
+            .tree
+            .borrow()
+            .neighbors_directed(self.parent_index, petgraph::Direction::Outgoing)
+            .nth(self.child_n)
+            .unwrap();
+
+        result
+    }
+}
+
+// struct CachedQueryOutput {
+//     output: Box<dyn Any>,
+//     revision: Revision,
+// }
+
+#[derive(Default)]
+struct DebugContext {
+    indent: usize,
 }
 
 struct WidgetTree {
-    t: DiGraph<WidgetTreeWeight, ()>,
+    size: RefCell<Size>,
+    tree: RefCell<DiGraph<WidgetTreeWeight, ()>>,
     root: Option<NodeIndex>,
-    revision: usize,
+    // revision: usize,
+    // where here the Box<dyn Any> is a hashmap from input type to CachedQueryOutput for that input type
+    query_cache: RefCell<HashMap<TypeId, Box<dyn Any>>>,
+    debug_context: RefCell<DebugContext>,
 }
 
 impl WidgetTree {
     pub fn new() -> Self {
         Self {
-            t: DiGraph::<WidgetTreeWeight, ()>::new(),
+            size: RefCell::new(Size::ZERO),
+            tree: RefCell::new(DiGraph::<WidgetTreeWeight, ()>::new()),
             root: None,
-            revision: 0,
+            // revision: 0,
+            query_cache: RefCell::new(HashMap::new()),
+            debug_context: RefCell::new(DebugContext::default()),
         }
     }
 
@@ -165,12 +380,10 @@ impl WidgetTree {
         layouter: Box<dyn Layouter>,
         drawer: Option<Box<dyn Drawer>>,
     ) -> NodeIndex {
-        let idx = self.t.add_node(WidgetTreeWeight {
-            layouter,
-            drawer,
-            position: Point::ORIGIN,
-            size: Size::ZERO,
-        });
+        let idx = self
+            .tree
+            .borrow_mut()
+            .add_node(WidgetTreeWeight { layouter, drawer });
 
         if self.root.is_none() {
             self.root = Some(idx)
@@ -179,56 +392,14 @@ impl WidgetTree {
         idx
     }
 
-    pub fn layout(&mut self, constraints: Constraints) {
-        let Some(root) = self.root else { return };
-        self.layout_index(root, constraints);
-    }
-
-    fn layout_index(&mut self, index: NodeIndex, constraints: Constraints) -> Size {
-        {
-            let mut weight = self.t.node_weight_mut(index).unwrap();
-            weight.layouter.callback_begin_layout();
-        }
-
-        // todo(chad): performance
-        let children = self
-            .t
-            .neighbors_directed(index, petgraph::Direction::Outgoing)
-            .collect::<Vec<_>>();
-
-        for child in children {
-            let child_constraints = {
-                let mut child_weight = self.t.node_weight_mut(index).unwrap();
-                child_weight
-                    .layouter
-                    .constrain_child(LayouterConstrainChildrenCtx { constraints })
-            };
-
-            let child_size = self.layout_index(child, child_constraints);
-            self.t.node_weight_mut(child).unwrap().size = child_size;
-
-            {
-                let mut child_weight = self.t.node_weight_mut(index).unwrap();
-                let child_position = child_weight
-                    .layouter
-                    .child_was_sized_compute_position(LayoutChildWasSizedCtx { child_size });
-                child_weight.position = child_position;
-            }
-        }
-
-        let mut weight = self.t.node_weight_mut(index).unwrap();
-        weight
-            .layouter
-            .size_self(LayouterSizeSelfCtx { constraints })
-        // Size::ZERO
-    }
-
-    pub fn draw_index(&mut self, index: NodeIndex, scene: &mut Scene, offset_pos: Point) {
+    pub fn draw_index(&'static self, index: NodeIndex, scene: &mut Scene, offset_pos: Point) {
         let position = {
-            let mut weight = self.t.node_weight_mut(index).unwrap();
-            let position = weight.position;
-            let size = weight.size;
-            weight.drawer.as_mut().map(|d| {
+            let weight = self.tree.borrow();
+            let weight = weight.node_weight(index).unwrap();
+
+            let position: Point = self.get_cached_query_or_compute(NodePosition { index });
+            let size: Size = self.get_cached_query_or_compute(NodeSize { index });
+            weight.drawer.as_ref().map(|d| {
                 d.draw(DrawerCtx {
                     scene,
                     rect: Rect::from_origin_size(position, size),
@@ -239,7 +410,8 @@ impl WidgetTree {
 
         // todo(chad): performance
         let neighbors = self
-            .t
+            .tree
+            .borrow()
             .neighbors_directed(index, petgraph::Direction::Outgoing)
             .collect::<Vec<_>>();
         for child in neighbors {
@@ -248,9 +420,64 @@ impl WidgetTree {
         }
     }
 
-    pub fn draw(&mut self, scene: &mut Scene) {
+    pub fn draw(&'static self, scene: &mut Scene) {
         let Some(root) = self.root else { return };
         self.draw_index(root, scene, Point::ORIGIN);
+    }
+
+    pub fn get_cached_query_or_compute<I: QueryKey + 'static>(
+        &'static self,
+        input: I,
+    ) -> <I as QueryKey>::Output {
+        // println!(
+        //     "{}Computing {:?}",
+        //     "  ".repeat(self.debug_context.borrow().indent),
+        //     input
+        // );
+
+        if let Some(cached_output) = self.get_cached_query(&input) {
+            // println!(
+            //     "{}Result {:?}",
+            //     "  ".repeat(self.debug_context.borrow().indent),
+            //     &cached_output
+            // );
+            return cached_output;
+        }
+
+        self.debug_context.borrow_mut().indent += 1;
+
+        let output = input.execute(self);
+        self.cache_query(input, output.clone());
+
+        self.debug_context.borrow_mut().indent -= 1;
+        // println!(
+        //     "{}Result {:?}",
+        //     "  ".repeat(self.debug_context.borrow().indent),
+        //     output.clone()
+        // );
+
+        output.clone()
+    }
+
+    pub fn cache_query<I: QueryKey + 'static, O: 'static>(&'static self, input: I, output: O) {
+        let mut cache = self.query_cache.borrow_mut();
+        let cache = cache
+            .entry(TypeId::of::<I>())
+            .or_insert_with(|| Box::new(HashMap::<I, O>::new()))
+            .downcast_mut::<HashMap<I, O>>()
+            .unwrap();
+        cache.insert(input, output);
+    }
+
+    pub fn get_cached_query<I: QueryKey + 'static, O: Clone + 'static>(
+        &'static self,
+        input: &I,
+    ) -> Option<O> {
+        let qc = self.query_cache.borrow();
+        let type_id = TypeId::of::<I>();
+        let qc = qc.get(&type_id)?;
+        let qc = qc.downcast_ref::<HashMap<I, O>>()?;
+        qc.get(input).cloned()
     }
 }
 
@@ -267,6 +494,9 @@ impl ApplicationHandler for SimpleVelloApp<'_> {
 
         // Create a vello Surface
         let size = window.inner_size();
+
+        *self.widget_tree.size.borrow_mut() = Size::new(size.width as f64, size.height as f64);
+
         let surface_future = self.context.create_surface(
             window.clone(),
             size.width,
@@ -315,6 +545,8 @@ impl ApplicationHandler for SimpleVelloApp<'_> {
             WindowEvent::Resized(size) => {
                 self.context
                     .resize_surface(&mut render_state.surface, size.width, size.height);
+                *self.widget_tree.size.borrow_mut() =
+                    Size::new(size.width as f64, size.height as f64);
             }
 
             // This is where all the rendering happens
@@ -328,10 +560,10 @@ impl ApplicationHandler for SimpleVelloApp<'_> {
 
                 // Re-add the objects to draw to the scene.
                 // add_shapes_to_scene(&mut self.scene);
-                self.widget_tree.layout(Constraints {
-                    min: Size::new(0.0, 0.0),
-                    max: Size::new(surface.config.width as f64, surface.config.height as f64),
-                });
+                // self.widget_tree.layout(Constraints {
+                //     min: Size::new(0.0, 0.0),
+                //     max: Size::new(surface.config.width as f64, surface.config.height as f64),
+                // });
                 self.widget_tree.draw(&mut self.scene);
 
                 // Get the window size
@@ -378,7 +610,7 @@ impl ApplicationHandler for SimpleVelloApp<'_> {
 struct SimpleQuadDrawer {}
 
 impl Drawer for SimpleQuadDrawer {
-    fn draw(&mut self, ctx: DrawerCtx) {
+    fn draw(&self, ctx: DrawerCtx) {
         // Draw an outlined rectangle
         let stroke = Stroke::new(6.0);
         let rect = RoundedRect::new(ctx.rect.x0, ctx.rect.y0, ctx.rect.x1, ctx.rect.y1, 20.0);
@@ -401,29 +633,37 @@ struct SizedBoxLayouter {
 }
 
 impl Layouter for SizedBoxLayouter {
-    fn size_self(&mut self, _ctx: LayouterSizeSelfCtx) -> Size {
+    fn size_self(
+        &self,
+        _tree: &'static WidgetTree,
+        _index: NodeIndex,
+        _ctx: LayouterSizeSelfCtx,
+    ) -> Size {
         self.size
     }
 
-    fn callback_begin_layout(&mut self) {}
-
-    fn constrain_child(&mut self, ctx: LayouterConstrainChildrenCtx) -> Constraints {
+    fn constrain_child(
+        &self,
+        _tree: &'static WidgetTree,
+        _index: NodeIndex,
+        ctx: LayouterConstrainChildrenCtx,
+    ) -> Constraints {
         ctx.constraints
     }
 
-    fn child_was_sized_compute_position(&mut self, _ctx: LayoutChildWasSizedCtx) -> Point {
+    fn child_was_sized_compute_position(
+        &self,
+        _tree: &'static WidgetTree,
+        _index: NodeIndex,
+        _ctx: LayoutChildWasSizedCtx,
+    ) -> Point {
         Point::ORIGIN
     }
 }
 
 fn main() -> Result<()> {
     let mut widget_tree = WidgetTree::new();
-    let root = widget_tree.add_node(
-        Box::new(RowLayouter {
-            child_sizes: vec![],
-        }),
-        None,
-    );
+    let root = widget_tree.add_node(Box::new(RowLayouter {}), None);
     let child1 = widget_tree.add_node(
         Box::new(SizedBoxLayouter {
             size: Size::new(100.0, 100.0),
@@ -442,9 +682,11 @@ fn main() -> Result<()> {
         }),
         Some(Box::new(SimpleQuadDrawer {})),
     );
-    widget_tree.t.add_edge(root, child1, ());
-    widget_tree.t.add_edge(root, child2, ());
-    widget_tree.t.add_edge(child1, child3, ());
+    widget_tree.tree.borrow_mut().add_edge(root, child1, ());
+    widget_tree.tree.borrow_mut().add_edge(root, child2, ());
+    widget_tree.tree.borrow_mut().add_edge(root, child3, ());
+
+    let widget_tree = Box::leak(Box::new(widget_tree));
 
     let mut app = SimpleVelloApp {
         context: RenderContext::new(),
@@ -458,6 +700,7 @@ fn main() -> Result<()> {
     event_loop
         .run_app(&mut app)
         .expect("Couldn't run event loop");
+
     Ok(())
 }
 

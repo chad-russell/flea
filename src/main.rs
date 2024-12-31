@@ -56,7 +56,7 @@ impl std::cmp::Eq for Constraints {}
 #[derive(Clone, Copy, Hash, Debug, PartialEq, Eq)]
 struct LayouterConstrainChildrenCtx {
     child_n: usize,
-    constraints: Constraints,
+    self_constraints: Constraints,
 }
 
 #[derive(Clone, Copy, Hash, Debug, PartialEq)]
@@ -71,19 +71,19 @@ struct LayouterSizeSelfCtx {
 }
 
 trait Layouter {
-    fn constrain_child(
+    fn constraints_for_child(
         &self,
         tree: &'static WidgetTree,
         index: NodeIndex,
         ctx: LayouterConstrainChildrenCtx,
     ) -> Constraints;
-    fn child_was_sized_compute_position(
+    fn position_for_child(
         &self,
         tree: &'static WidgetTree,
         index: NodeIndex,
         ctx: LayoutChildWasSizedCtx,
     ) -> Point;
-    fn size_self(
+    fn size_for_self(
         &self,
         tree: &'static WidgetTree,
         index: NodeIndex,
@@ -94,14 +94,14 @@ trait Layouter {
 struct RowLayouter {}
 
 impl Layouter for RowLayouter {
-    fn constrain_child(
+    fn constraints_for_child(
         &self,
         tree: &'static WidgetTree,
         index: NodeIndex,
         ctx: LayouterConstrainChildrenCtx,
     ) -> Constraints {
         if ctx.child_n == 0 {
-            return ctx.constraints;
+            return ctx.self_constraints;
         }
 
         let prev_child_index = tree.get_cached_query_or_compute(NthChild {
@@ -116,33 +116,34 @@ impl Layouter for RowLayouter {
         let prev_child_position = tree.get_cached_query_or_compute(NodePosition {
             index: prev_child_index,
         });
-        println!("prev child position: {:?}", prev_child_position);
 
         let remaining_width =
-            ctx.constraints.max.width - prev_child_position.x - prev_child_size.width;
+            ctx.self_constraints.max.width - prev_child_position.x - prev_child_size.width;
 
         Constraints {
-            min: ctx.constraints.min,
+            min: ctx.self_constraints.min,
             max: Size {
                 width: remaining_width,
-                height: ctx.constraints.max.height,
+                height: ctx.self_constraints.max.height,
             },
         }
     }
 
-    fn child_was_sized_compute_position(
+    fn position_for_child(
         &self,
         tree: &'static WidgetTree,
         index: NodeIndex,
         ctx: LayoutChildWasSizedCtx,
     ) -> Point {
+        println!("computing position for child.....");
+
         if ctx.child_n == 0 {
             return Point::ORIGIN;
         }
 
         let prev_child_index = tree.get_cached_query_or_compute(NthChild {
             parent_index: index,
-            child_n: ctx.child_n,
+            child_n: ctx.child_n - 1,
         });
 
         let prev_child_size = tree.get_cached_query_or_compute(NodeSize {
@@ -153,13 +154,18 @@ impl Layouter for RowLayouter {
             index: prev_child_index,
         });
 
+        println!(
+            "prev child -- index: {:?}, position: {:?}, size: {:?}",
+            prev_child_index, prev_child_position, prev_child_size
+        );
+
         Point::new(
             prev_child_position.x + prev_child_size.width,
             prev_child_position.y,
         )
     }
 
-    fn size_self(
+    fn size_for_self(
         &self,
         tree: &'static WidgetTree,
         index: NodeIndex,
@@ -225,6 +231,8 @@ impl QueryKey for NodePosition {
     type Output = Point;
 
     fn execute(&self, tree: &'static WidgetTree) -> Self::Output {
+        println!("node positon for {:?}", self);
+
         if self.index == tree.root.unwrap() {
             return Point::ORIGIN;
         }
@@ -246,10 +254,10 @@ impl QueryKey for NodePosition {
 
         tree.tree
             .borrow()
-            .node_weight(self.index)
+            .node_weight(parent)
             .unwrap()
             .layouter
-            .child_was_sized_compute_position(tree, self.index, LayoutChildWasSizedCtx { child_n })
+            .position_for_child(tree, parent, LayoutChildWasSizedCtx { child_n })
     }
 }
 
@@ -292,12 +300,12 @@ impl QueryKey for NodeConstraints {
             .node_weight(parent)
             .unwrap()
             .layouter
-            .constrain_child(
+            .constraints_for_child(
                 tree,
                 parent,
                 LayouterConstrainChildrenCtx {
                     child_n,
-                    constraints: parent_constraints,
+                    self_constraints: parent_constraints,
                 },
             )
     }
@@ -318,7 +326,7 @@ impl QueryKey for NodeSize {
             .node_weight(self.index)
             .unwrap()
             .layouter
-            .size_self(tree, self.index, LayouterSizeSelfCtx { constraints })
+            .size_for_self(tree, self.index, LayouterSizeSelfCtx { constraints })
     }
 }
 
@@ -633,7 +641,7 @@ struct SizedBoxLayouter {
 }
 
 impl Layouter for SizedBoxLayouter {
-    fn size_self(
+    fn size_for_self(
         &self,
         _tree: &'static WidgetTree,
         _index: NodeIndex,
@@ -642,16 +650,16 @@ impl Layouter for SizedBoxLayouter {
         self.size
     }
 
-    fn constrain_child(
+    fn constraints_for_child(
         &self,
         _tree: &'static WidgetTree,
         _index: NodeIndex,
         ctx: LayouterConstrainChildrenCtx,
     ) -> Constraints {
-        ctx.constraints
+        ctx.self_constraints
     }
 
-    fn child_was_sized_compute_position(
+    fn position_for_child(
         &self,
         _tree: &'static WidgetTree,
         _index: NodeIndex,

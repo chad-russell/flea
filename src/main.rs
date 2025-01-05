@@ -276,11 +276,6 @@ trait Drawer {
     fn draw(&self, ctx: DrawerCtx);
 }
 
-// struct Revision {
-//     last_updated: usize,
-//     valid_through: usize,
-// }
-
 struct WidgetTreeWeight {
     layouter: Box<dyn Layouter>,
     drawer: Option<Box<dyn Drawer>>,
@@ -290,6 +285,15 @@ trait QueryKey: Clone + std::hash::Hash + std::fmt::Debug + PartialEq + Eq {
     type Output: Clone + std::fmt::Debug;
 
     fn execute(&self, tree: &'static WidgetTree) -> Self::Output;
+}
+
+#[derive(Clone, Copy, Hash, Debug, PartialEq, Eq)]
+struct SignalId(usize);
+
+#[derive(Clone, Copy, Hash, Debug, PartialEq, Eq)]
+struct Signal<T> {
+    id: SignalId,
+    phantom: std::marker::PhantomData<T>,
 }
 
 #[derive(Clone, Copy, Hash, Debug, PartialEq, Eq)]
@@ -419,24 +423,29 @@ impl QueryKey for NthChild {
     }
 }
 
-// struct CachedQueryOutput {
-//     output: Box<dyn Any>,
-//     revision: Revision,
-// }
+#[derive(Clone, Copy, Hash, Debug, PartialEq, Eq)]
+struct RevisionId(usize);
 
-#[derive(Default)]
-struct DebugContext {
-    indent: usize,
+#[derive(Clone, Copy)]
+struct Revision {
+    last_changed: usize,
+    valid_through: usize,
+}
+
+#[derive(Clone)]
+struct CachedQueryOutput<T: Clone> {
+    output: T,
+    revision: Revision,
 }
 
 struct WidgetTree {
     size: RefCell<Size>,
     tree: RefCell<DiGraph<WidgetTreeWeight, ()>>,
     root: RefCell<Option<NodeIndex>>,
-    // revision: usize,
+    revision: usize,
     // where here the Box<dyn Any> is a hashmap from input type to CachedQueryOutput for that input type
     query_cache: RefCell<HashMap<TypeId, Box<dyn Any>>>,
-    debug_context: RefCell<DebugContext>,
+    signals: RefCell<HashMap<SignalId, Box<dyn Any>>>,
 }
 
 impl WidgetTree {
@@ -445,10 +454,30 @@ impl WidgetTree {
             size: RefCell::new(Size::ZERO),
             tree: RefCell::new(DiGraph::<WidgetTreeWeight, ()>::new()),
             root: RefCell::new(None),
-            // revision: 0,
+            revision: 0,
             query_cache: RefCell::new(HashMap::new()),
-            debug_context: RefCell::new(DebugContext::default()),
+            signals: RefCell::new(HashMap::new()),
         }
+    }
+
+    pub fn create_signal<T: Clone + 'static>(&'static self, value: T) -> Signal<T> {
+        let mut signals = self.signals.borrow_mut();
+        let id = SignalId(signals.len());
+        signals.insert(id, Box::new(value));
+        Signal {
+            id,
+            phantom: std::marker::PhantomData,
+        }
+    }
+
+    pub fn get_signal<T: Clone + 'static>(&'static self, signal: Signal<T>) -> T {
+        let signals = self.signals.borrow();
+        signals
+            .get(&signal.id)
+            .unwrap()
+            .downcast_ref::<T>()
+            .unwrap()
+            .clone()
     }
 
     pub fn add_node(
@@ -472,7 +501,7 @@ impl WidgetTree {
         &'static self,
         parent_index: impl IntoNodeIndex,
         child_index: impl IntoNodeIndex,
-    ) -> NodeIndex {
+    ) -> (NodeIndex, NodeIndex) {
         let parent_index = parent_index.into(self);
         let child_index = child_index.into(self);
 
@@ -480,22 +509,23 @@ impl WidgetTree {
             .borrow_mut()
             .add_edge(parent_index, child_index, ());
 
-        child_index
+        (parent_index, child_index)
     }
 
-    pub fn add_child_index(
+    pub fn add_child_return_parent(
         &'static self,
         parent_index: impl IntoNodeIndex,
         child_index: impl IntoNodeIndex,
     ) -> NodeIndex {
-        let child_index = child_index.into(self);
-        let parent_index = parent_index.into(self);
+        self.add_child(parent_index, child_index).0
+    }
 
-        self.tree
-            .borrow_mut()
-            .add_edge(parent_index, child_index, ());
-
-        parent_index
+    pub fn add_child_return_child(
+        &'static self,
+        parent_index: impl IntoNodeIndex,
+        child_index: impl IntoNodeIndex,
+    ) -> NodeIndex {
+        self.add_child(parent_index, child_index).1
     }
 
     pub fn draw_index(&'static self, index: NodeIndex, scene: &mut Scene, offset_pos: Point) {
@@ -542,33 +572,15 @@ impl WidgetTree {
         &'static self,
         input: I,
     ) -> <I as QueryKey>::Output {
-        println!(
-            "{}Computing {:?}",
-            "  ".repeat(self.debug_context.borrow().indent),
-            input
-        );
-
         if let Some(cached_output) = self.get_cached_query(&input) {
-            println!(
-                "{}Result {:?}",
-                "  ".repeat(self.debug_context.borrow().indent),
-                &cached_output
-            );
-            return cached_output;
+            if cached_output.revision.valid_through < self.revision {
+                todo!("Possibly needs recompute");
+            }
+            return cached_output.output;
         }
-
-        self.debug_context.borrow_mut().indent += 1;
 
         let output = input.execute(self);
         self.cache_query(input, output.clone());
-
-        self.debug_context.borrow_mut().indent -= 1;
-        println!(
-            "{}Result {:?}",
-            "  ".repeat(self.debug_context.borrow().indent),
-            output.clone()
-        );
-
         output.clone()
     }
 
@@ -585,11 +597,11 @@ impl WidgetTree {
     pub fn get_cached_query<I: QueryKey + 'static, O: Clone + 'static>(
         &'static self,
         input: &I,
-    ) -> Option<O> {
+    ) -> Option<CachedQueryOutput<O>> {
         let qc = self.query_cache.borrow();
         let type_id = TypeId::of::<I>();
         let qc = qc.get(&type_id)?;
-        let qc = qc.downcast_ref::<HashMap<I, O>>()?;
+        let qc = qc.downcast_ref::<HashMap<I, CachedQueryOutput<O>>>()?;
         qc.get(input).cloned()
     }
 }
@@ -694,7 +706,7 @@ impl ApplicationHandler for SimpleVelloApp<'_> {
                 let surface = &render_state.surface;
 
                 self.widget_tree.draw(&mut self.scene);
-                println!("===================");
+                // println!("===================");
 
                 // Get the window size
                 let width = surface.config.width;
@@ -763,6 +775,39 @@ impl Drawer for SimpleQuadDrawer {
     }
 }
 
+struct DynamicallySizedBoxLayouter {
+    size: Signal<Size>,
+}
+
+impl Layouter for DynamicallySizedBoxLayouter {
+    fn size_for_self(
+        &self,
+        tree: &'static WidgetTree,
+        _index: NodeIndex,
+        _ctx: LayouterSizeSelfCtx,
+    ) -> Size {
+        tree.get_signal(self.size)
+    }
+
+    fn constraints_for_child(
+        &self,
+        _tree: &'static WidgetTree,
+        _index: NodeIndex,
+        ctx: LayouterConstrainChildrenCtx,
+    ) -> Constraints {
+        ctx.self_constraints
+    }
+
+    fn position_for_child(
+        &self,
+        _tree: &'static WidgetTree,
+        _index: NodeIndex,
+        _ctx: LayoutChildWasSizedCtx,
+    ) -> Point {
+        Point::ORIGIN
+    }
+}
+
 struct SizedBoxLayouter {
     size: Size,
 }
@@ -796,49 +841,53 @@ impl Layouter for SizedBoxLayouter {
     }
 }
 
-// fn padded(widget_tree: &'static WidgetTree, child_index: NodeIndex, p: Padded) -> NodeIndex {
-//     let parent_index = widget_tree.add_node(Box::new(p), None);
-//     widget_tree
-//         .tree
-//         .borrow_mut()
-//         .add_edge(parent_index, child_index, ());
-//     parent_index
-// }
-
-fn padded(
-    widget_tree: &'static WidgetTree,
-    child: impl IntoNodeIndex,
-    p: Padded,
-) -> impl IntoNodeIndex {
-    widget_tree.add_child_index(p, child)
-}
+// todo(chad):
+// # GENERAL
+// - Signals
+// - Implement cache red/green algorithm
+// - Interactivity (keyboard/mouse events)
+// - Text widget
+// - Builder widgets, regenerate subtree on change
+// - Animation
+//
+// # LAYOUTERS
+// - Align
+// - AspectRatio
+// - Center
+// - Expanded
+// - FractionallySized
+// - Transform
+// - Flow
+// - Grid
+// - List
+// - Stack
 
 fn main() -> Result<()> {
     let widget_tree = WidgetTree::new();
     let widget_tree = Box::leak(Box::new(widget_tree));
 
+    let dyn_size = widget_tree.create_signal(Size {
+        width: 100.0,
+        height: 100.0,
+    });
+
     let root = widget_tree.add_node(Box::new(RowLayouter {}), None);
     widget_tree.add_child(
         root,
-        padded(
-            widget_tree,
+        widget_tree.add_child_return_parent(
+            Padded::uniform(15.0),
             (
-                SizedBoxLayouter {
-                    size: Size::new(100.0, 100.0),
-                },
+                DynamicallySizedBoxLayouter { size: dyn_size },
                 SimpleQuadDrawer {
                     color: [0.6, 0.5, 0.4],
                 },
             ),
-            Padded::uniform(15.0),
         ),
     );
     widget_tree.add_child(
         root,
         (
-            SizedBoxLayouter {
-                size: Size::new(100.0, 100.0),
-            },
+            DynamicallySizedBoxLayouter { size: dyn_size },
             SimpleQuadDrawer {
                 color: [0.6, 0.5, 0.4],
             },
@@ -847,9 +896,7 @@ fn main() -> Result<()> {
     widget_tree.add_child(
         root,
         (
-            SizedBoxLayouter {
-                size: Size::new(100.0, 100.0),
-            },
+            DynamicallySizedBoxLayouter { size: dyn_size },
             SimpleQuadDrawer {
                 color: [0.6, 0.5, 0.4],
             },

@@ -104,18 +104,13 @@ impl Layouter for RowLayouter {
             return ctx.self_constraints;
         }
 
-        let prev_child_index = tree.get_cached_query_or_compute(NthChild {
+        let prev_child_index = tree.query_nth_child(NthChild {
             parent_index: index,
             child_n: ctx.child_n - 1,
         });
 
-        let prev_child_size = tree.get_cached_query_or_compute(NodeSize {
-            index: prev_child_index,
-        });
-
-        let prev_child_position = tree.get_cached_query_or_compute(NodePosition {
-            index: prev_child_index,
-        });
+        let prev_child_size = tree.query_node_size(prev_child_index);
+        let prev_child_position = tree.query_node_position(prev_child_index);
 
         let remaining_width =
             ctx.self_constraints.max.width - prev_child_position.x - prev_child_size.width;
@@ -139,18 +134,13 @@ impl Layouter for RowLayouter {
             return Point::ORIGIN;
         }
 
-        let prev_child_index = tree.get_cached_query_or_compute(NthChild {
+        let prev_child_index = tree.query_nth_child(NthChild {
             parent_index: index,
             child_n: ctx.child_n - 1,
         });
 
-        let prev_child_size = tree.get_cached_query_or_compute(NodeSize {
-            index: prev_child_index,
-        });
-
-        let prev_child_position = tree.get_cached_query_or_compute(NodePosition {
-            index: prev_child_index,
-        });
+        let prev_child_size = tree.query_node_size(prev_child_index);
+        let prev_child_position = tree.query_node_position(prev_child_index);
 
         Point::new(
             prev_child_position.x + prev_child_size.width,
@@ -172,15 +162,11 @@ impl Layouter for RowLayouter {
         let last_child_index = *child_indices.last().unwrap();
 
         let last_child_x = tree
-            .get_cached_query_or_compute(NodePosition {
-                index: last_child_index,
-            })
+            .query_node_position(last_child_index)
             .x;
 
         let last_child_width = tree
-            .get_cached_query_or_compute(NodeSize {
-                index: last_child_index,
-            })
+            .query_node_size(last_child_index)
             .width;
 
         return Size {
@@ -220,8 +206,8 @@ impl Padded {
 impl Layouter for Padded {
     fn constraints_for_child(
         &self,
-        tree: &'static WidgetTree,
-        index: NodeIndex,
+        _tree: &'static WidgetTree,
+        _index: NodeIndex,
         ctx: LayouterConstrainChildrenCtx,
     ) -> Constraints {
         Constraints {
@@ -235,9 +221,9 @@ impl Layouter for Padded {
 
     fn position_for_child(
         &self,
-        tree: &'static WidgetTree,
-        index: NodeIndex,
-        ctx: LayoutChildWasSizedCtx,
+        _tree: &'static WidgetTree,
+        _index: NodeIndex,
+        _ctx: LayoutChildWasSizedCtx,
     ) -> Point {
         Point {
             x: self.left,
@@ -253,12 +239,12 @@ impl Layouter for Padded {
     ) -> Size {
         // todo(chad): compute largest child. For now, just assume one child and comput 0th child
         // OR, we can assert that this widget only has one child
-        let first_child = tree.get_cached_query_or_compute(NthChild {
+        let first_child = tree.query_nth_child(NthChild {
             parent_index: index,
             child_n: 0,
         });
 
-        let first_child_size = tree.get_cached_query_or_compute(NodeSize { index: first_child });
+        let first_child_size = tree.query_node_size(first_child);
 
         Size {
             width: first_child_size.width + self.left + self.right,
@@ -279,6 +265,15 @@ trait Drawer {
 struct WidgetTreeWeight {
     layouter: Box<dyn Layouter>,
     drawer: Option<Box<dyn Drawer>>,
+}
+
+#[derive(Clone, Copy, Hash, Debug, PartialEq, Eq)]
+enum QueryDependency {
+    NodePosition(NodeIndex),
+    NodeConstraints(NodeIndex),
+    NodeSize(NodeIndex),
+    NthChild(NthChild),
+    Signal(SignalId),
 }
 
 trait QueryKey: Clone + std::hash::Hash + std::fmt::Debug + PartialEq + Eq {
@@ -357,7 +352,7 @@ impl QueryKey for NodeConstraints {
             .unwrap();
 
         let parent_constraints =
-            tree.get_cached_query_or_compute(NodeConstraints { index: parent });
+            tree.query_node_constraints(parent);
 
         // todo(chad): performance
         let child_n = tree
@@ -392,7 +387,7 @@ impl QueryKey for NodeSize {
     type Output = Size;
 
     fn execute(&self, tree: &'static WidgetTree) -> Self::Output {
-        let constraints = tree.get_cached_query_or_compute(NodeConstraints { index: self.index });
+        let constraints = tree.query_node_constraints(self.index);
         tree.tree
             .borrow()
             .node_weight(self.index)
@@ -444,19 +439,30 @@ struct WidgetTree {
     root: RefCell<Option<NodeIndex>>,
     revision: usize,
     // where here the Box<dyn Any> is a hashmap from input type to CachedQueryOutput for that input type
-    query_cache: RefCell<HashMap<TypeId, Box<dyn Any>>>,
     signals: RefCell<HashMap<SignalId, Box<dyn Any>>>,
+    query_stack: RefCell<Vec<QueryDependency>>,
+    dependency_tree: RefCell<DiGraph<QueryDependency, ()>>,
+    // Query caches
+    node_position_query_cache: RefCell<HashMap<NodeIndex, Point>>,
+    node_size_query_cache: RefCell<HashMap<NodeIndex, Size>>,
+    node_constraints_query_cache: RefCell<HashMap<NodeIndex, Constraints>>,
+    nth_child_query_cache: RefCell<HashMap<NthChild, NodeIndex>>,
 }
 
 impl WidgetTree {
     pub fn new() -> Self {
         Self {
             size: RefCell::new(Size::ZERO),
-            tree: RefCell::new(DiGraph::<WidgetTreeWeight, ()>::new()),
+            tree: RefCell::new(DiGraph::new()),
             root: RefCell::new(None),
             revision: 0,
-            query_cache: RefCell::new(HashMap::new()),
             signals: RefCell::new(HashMap::new()),
+            query_stack: RefCell::new(Vec::new()),
+            dependency_tree: RefCell::new(DiGraph::new()),
+            node_position_query_cache: RefCell::new(HashMap::new()),
+            node_size_query_cache: RefCell::new(HashMap::new()),
+            node_constraints_query_cache: RefCell::new(HashMap::new()),
+            nth_child_query_cache: RefCell::new(HashMap::new()),
         }
     }
 
@@ -470,14 +476,24 @@ impl WidgetTree {
         }
     }
 
+    fn track_dependency<T: Clone + 'static>(&'static self, dep: Signal<T>) {
+        self.query_stack.borrow().last().map(|q| {
+            //self.dependency_tree.borrow_mut().edge_weight
+        });
+    }
+
     pub fn get_signal<T: Clone + 'static>(&'static self, signal: Signal<T>) -> T {
         let signals = self.signals.borrow();
-        signals
+        let sig = signals
             .get(&signal.id)
             .unwrap()
             .downcast_ref::<T>()
             .unwrap()
-            .clone()
+            .clone();
+
+        self.track_dependency(signal);
+
+        sig
     }
 
     pub fn add_node(
@@ -520,24 +536,24 @@ impl WidgetTree {
         self.add_child(parent_index, child_index).0
     }
 
-    pub fn add_child_return_child(
-        &'static self,
-        parent_index: impl IntoNodeIndex,
-        child_index: impl IntoNodeIndex,
-    ) -> NodeIndex {
-        self.add_child(parent_index, child_index).1
-    }
+    //pub fn add_child_return_child(
+    //    &'static self,
+    //    parent_index: impl IntoNodeIndex,
+    //    child_index: impl IntoNodeIndex,
+    //) -> NodeIndex {
+    //    self.add_child(parent_index, child_index).1
+    //}
 
     pub fn draw_index(&'static self, index: NodeIndex, scene: &mut Scene, offset_pos: Point) {
         let position = {
             let weight = self.tree.borrow();
             let weight = weight.node_weight(index).unwrap();
 
-            let mut position: Point = self.get_cached_query_or_compute(NodePosition { index });
+            let mut position: Point = self.query_node_position(index);
             position.x += offset_pos.x;
             position.y += offset_pos.y;
 
-            let size: Size = self.get_cached_query_or_compute(NodeSize { index });
+            let size: Size = self.query_node_size(index);
 
             weight.drawer.as_ref().map(|d| {
                 d.draw(DrawerCtx {
@@ -568,41 +584,64 @@ impl WidgetTree {
         self.draw_index(root, scene, Point::ORIGIN);
     }
 
-    pub fn get_cached_query_or_compute<I: QueryKey + 'static>(
-        &'static self,
-        input: I,
-    ) -> <I as QueryKey>::Output {
-        if let Some(cached_output) = self.get_cached_query(&input) {
-            if cached_output.revision.valid_through < self.revision {
-                todo!("Possibly needs recompute");
-            }
-            return cached_output.output;
+    pub fn query_nth_child(&'static self, q: NthChild) -> NodeIndex {
+        if let Some(cached_output) = self.nth_child_query_cache.borrow().get(&q) {
+            return *cached_output;
         }
 
-        let output = input.execute(self);
-        self.cache_query(input, output.clone());
-        output.clone()
+        self.query_stack.borrow_mut().push(QueryDependency::NthChild(q));
+
+        let output = q.execute(self);
+
+        self.query_stack.borrow_mut().pop().unwrap();
+
+        self.nth_child_query_cache.borrow_mut().insert(q, output);
+        output
     }
 
-    pub fn cache_query<I: QueryKey + 'static, O: 'static>(&'static self, input: I, output: O) {
-        let mut cache = self.query_cache.borrow_mut();
-        let cache = cache
-            .entry(TypeId::of::<I>())
-            .or_insert_with(|| Box::new(HashMap::<I, O>::new()))
-            .downcast_mut::<HashMap<I, O>>()
-            .unwrap();
-        cache.insert(input, output);
+    pub fn query_node_constraints(&'static self, q: NodeIndex) -> Constraints {
+        if let Some(cached_output) = self.node_constraints_query_cache.borrow().get(&q) {
+            return *cached_output;
+        }
+
+        self.query_stack.borrow_mut().push(QueryDependency::NodeConstraints(q));
+
+        let output = NodeConstraints { index: q }.execute(self);
+
+        self.query_stack.borrow_mut().pop().unwrap();
+
+        self.node_constraints_query_cache.borrow_mut().insert(q, output);
+        output
     }
 
-    pub fn get_cached_query<I: QueryKey + 'static, O: Clone + 'static>(
-        &'static self,
-        input: &I,
-    ) -> Option<CachedQueryOutput<O>> {
-        let qc = self.query_cache.borrow();
-        let type_id = TypeId::of::<I>();
-        let qc = qc.get(&type_id)?;
-        let qc = qc.downcast_ref::<HashMap<I, CachedQueryOutput<O>>>()?;
-        qc.get(input).cloned()
+    pub fn query_node_size(&'static self, q: NodeIndex) -> Size {
+        if let Some(cached_output) = self.node_size_query_cache.borrow().get(&q) {
+            return *cached_output;
+        }
+
+        self.query_stack.borrow_mut().push(QueryDependency::NodeSize(q));
+
+        let output = NodeSize { index: q }.execute(self);
+
+        self.query_stack.borrow_mut().pop().unwrap();
+
+        self.node_size_query_cache.borrow_mut().insert(q, output);
+        output
+    }
+
+    pub fn query_node_position(&'static self, q: NodeIndex) -> Point {
+        if let Some(cached_output) = self.node_position_query_cache.borrow().get(&q) {
+            return *cached_output;
+        }
+
+        self.query_stack.borrow_mut().push(QueryDependency::NodePosition(q));
+
+        let output = NodePosition { index: q }.execute(self);
+
+        self.query_stack.borrow_mut().pop().unwrap();
+
+        self.node_position_query_cache.borrow_mut().insert(q, output);
+        output
     }
 }
 

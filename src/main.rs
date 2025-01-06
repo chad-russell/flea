@@ -442,6 +442,7 @@ struct WidgetTree {
     signals: RefCell<HashMap<SignalId, Box<dyn Any>>>,
     query_stack: RefCell<Vec<QueryDependency>>,
     dependency_tree: RefCell<DiGraph<QueryDependency, ()>>,
+    dependency_node_map: RefCell<HashMap<QueryDependency, NodeIndex>>,
     // Query caches
     node_position_query_cache: RefCell<HashMap<NodeIndex, Point>>,
     node_size_query_cache: RefCell<HashMap<NodeIndex, Size>>,
@@ -459,11 +460,21 @@ impl WidgetTree {
             signals: RefCell::new(HashMap::new()),
             query_stack: RefCell::new(Vec::new()),
             dependency_tree: RefCell::new(DiGraph::new()),
+            dependency_node_map: RefCell::new(HashMap::new()),
             node_position_query_cache: RefCell::new(HashMap::new()),
             node_size_query_cache: RefCell::new(HashMap::new()),
             node_constraints_query_cache: RefCell::new(HashMap::new()),
             nth_child_query_cache: RefCell::new(HashMap::new()),
         }
+    }
+
+    fn track_dependency(&'static self, dep: QueryDependency) {
+        let qs = self.query_stack.borrow();
+        let Some(q) = qs.last() else { return };
+
+        let dep_node_index = self.dependency_node_map.borrow_mut().entry(dep).or_insert_with(|| self.dependency_tree.borrow_mut().add_node(dep)).clone();
+        let q_node_index = self.dependency_node_map.borrow_mut().entry(*q).or_insert_with(|| self.dependency_tree.borrow_mut().add_node(*q)).clone();
+        self.dependency_tree.borrow_mut().add_edge(q_node_index, dep_node_index, ());
     }
 
     pub fn create_signal<T: Clone + 'static>(&'static self, value: T) -> Signal<T> {
@@ -476,12 +487,6 @@ impl WidgetTree {
         }
     }
 
-    fn track_dependency<T: Clone + 'static>(&'static self, dep: Signal<T>) {
-        self.query_stack.borrow().last().map(|q| {
-            //self.dependency_tree.borrow_mut().edge_weight
-        });
-    }
-
     pub fn get_signal<T: Clone + 'static>(&'static self, signal: Signal<T>) -> T {
         let signals = self.signals.borrow();
         let sig = signals
@@ -491,7 +496,7 @@ impl WidgetTree {
             .unwrap()
             .clone();
 
-        self.track_dependency(signal);
+        self.track_dependency(QueryDependency::Signal(signal.id));
 
         sig
     }
@@ -536,13 +541,13 @@ impl WidgetTree {
         self.add_child(parent_index, child_index).0
     }
 
-    //pub fn add_child_return_child(
-    //    &'static self,
-    //    parent_index: impl IntoNodeIndex,
-    //    child_index: impl IntoNodeIndex,
-    //) -> NodeIndex {
-    //    self.add_child(parent_index, child_index).1
-    //}
+    pub fn add_child_return_child(
+        &'static self,
+        parent_index: impl IntoNodeIndex,
+        child_index: impl IntoNodeIndex,
+    ) -> NodeIndex {
+        self.add_child(parent_index, child_index).1
+    }
 
     pub fn draw_index(&'static self, index: NodeIndex, scene: &mut Scene, offset_pos: Point) {
         let position = {
@@ -571,6 +576,7 @@ impl WidgetTree {
             .borrow()
             .neighbors_directed(index, petgraph::Direction::Outgoing)
             .collect::<Vec<_>>();
+
         for child in neighbors {
             let offset_pos = Point::new(offset_pos.x + position.x, offset_pos.y + position.y);
             self.draw_index(child, scene, offset_pos);
@@ -590,9 +596,7 @@ impl WidgetTree {
         }
 
         self.query_stack.borrow_mut().push(QueryDependency::NthChild(q));
-
         let output = q.execute(self);
-
         self.query_stack.borrow_mut().pop().unwrap();
 
         self.nth_child_query_cache.borrow_mut().insert(q, output);
@@ -605,9 +609,7 @@ impl WidgetTree {
         }
 
         self.query_stack.borrow_mut().push(QueryDependency::NodeConstraints(q));
-
         let output = NodeConstraints { index: q }.execute(self);
-
         self.query_stack.borrow_mut().pop().unwrap();
 
         self.node_constraints_query_cache.borrow_mut().insert(q, output);
@@ -620,9 +622,7 @@ impl WidgetTree {
         }
 
         self.query_stack.borrow_mut().push(QueryDependency::NodeSize(q));
-
         let output = NodeSize { index: q }.execute(self);
-
         self.query_stack.borrow_mut().pop().unwrap();
 
         self.node_size_query_cache.borrow_mut().insert(q, output);
@@ -635,9 +635,7 @@ impl WidgetTree {
         }
 
         self.query_stack.borrow_mut().push(QueryDependency::NodePosition(q));
-
         let output = NodePosition { index: q }.execute(self);
-
         self.query_stack.borrow_mut().pop().unwrap();
 
         self.node_position_query_cache.borrow_mut().insert(q, output);

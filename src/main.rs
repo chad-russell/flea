@@ -13,7 +13,7 @@ use vello::wgpu;
 use vello::{AaConfig, Renderer, RendererOptions, Scene};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::WindowEvent;
+use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::Window;
 
@@ -161,13 +161,9 @@ impl Layouter for RowLayouter {
             .collect::<Vec<_>>();
         let last_child_index = *child_indices.last().unwrap();
 
-        let last_child_x = tree
-            .query_node_position(last_child_index)
-            .x;
+        let last_child_x = tree.query_node_position(last_child_index).x;
 
-        let last_child_width = tree
-            .query_node_size(last_child_index)
-            .width;
+        let last_child_width = tree.query_node_size(last_child_index).width;
 
         return Size {
             width: last_child_x + last_child_width,
@@ -351,8 +347,7 @@ impl QueryKey for NodeConstraints {
             .next()
             .unwrap();
 
-        let parent_constraints =
-            tree.query_node_constraints(parent);
+        let parent_constraints = tree.query_node_constraints(parent);
 
         // todo(chad): performance
         let child_n = tree
@@ -429,7 +424,7 @@ struct Revision {
 
 #[derive(Clone)]
 struct CachedQueryOutput<T: Clone> {
-    output: T,
+    value: T,
     revision: Revision,
 }
 
@@ -437,17 +432,22 @@ struct WidgetTree {
     size: RefCell<Size>,
     tree: RefCell<DiGraph<WidgetTreeWeight, ()>>,
     root: RefCell<Option<NodeIndex>>,
-    revision: usize,
-    // where here the Box<dyn Any> is a hashmap from input type to CachedQueryOutput for that input type
+
+    revision: RefCell<usize>,
+
     signals: RefCell<HashMap<SignalId, Box<dyn Any>>>,
     query_stack: RefCell<Vec<QueryDependency>>,
     dependency_tree: RefCell<DiGraph<QueryDependency, ()>>,
     dependency_node_map: RefCell<HashMap<QueryDependency, NodeIndex>>,
+
     // Query caches
-    node_position_query_cache: RefCell<HashMap<NodeIndex, Point>>,
-    node_size_query_cache: RefCell<HashMap<NodeIndex, Size>>,
-    node_constraints_query_cache: RefCell<HashMap<NodeIndex, Constraints>>,
-    nth_child_query_cache: RefCell<HashMap<NthChild, NodeIndex>>,
+    node_position_query_cache: RefCell<HashMap<NodeIndex, CachedQueryOutput<Point>>>,
+    node_size_query_cache: RefCell<HashMap<NodeIndex, CachedQueryOutput<Size>>>,
+    node_constraints_query_cache: RefCell<HashMap<NodeIndex, CachedQueryOutput<Constraints>>>,
+    nth_child_query_cache: RefCell<HashMap<NthChild, CachedQueryOutput<NodeIndex>>>,
+
+    // Debug
+    cache_ratio: RefCell<(u64, u64)>,
 }
 
 impl WidgetTree {
@@ -456,7 +456,7 @@ impl WidgetTree {
             size: RefCell::new(Size::ZERO),
             tree: RefCell::new(DiGraph::new()),
             root: RefCell::new(None),
-            revision: 0,
+            revision: RefCell::new(0),
             signals: RefCell::new(HashMap::new()),
             query_stack: RefCell::new(Vec::new()),
             dependency_tree: RefCell::new(DiGraph::new()),
@@ -465,16 +465,30 @@ impl WidgetTree {
             node_size_query_cache: RefCell::new(HashMap::new()),
             node_constraints_query_cache: RefCell::new(HashMap::new()),
             nth_child_query_cache: RefCell::new(HashMap::new()),
+            cache_ratio: RefCell::new((0, 1)),
         }
     }
 
     fn track_dependency(&'static self, dep: QueryDependency) {
-        let qs = self.query_stack.borrow();
-        let Some(q) = qs.last() else { return };
+        let Some(q) = self.query_stack.borrow().last().cloned() else {
+            return;
+        };
 
-        let dep_node_index = self.dependency_node_map.borrow_mut().entry(dep).or_insert_with(|| self.dependency_tree.borrow_mut().add_node(dep)).clone();
-        let q_node_index = self.dependency_node_map.borrow_mut().entry(*q).or_insert_with(|| self.dependency_tree.borrow_mut().add_node(*q)).clone();
-        self.dependency_tree.borrow_mut().add_edge(q_node_index, dep_node_index, ());
+        let dep_node_index = self
+            .dependency_node_map
+            .borrow_mut()
+            .entry(dep)
+            .or_insert_with(|| self.dependency_tree.borrow_mut().add_node(dep))
+            .clone();
+        let q_node_index = self
+            .dependency_node_map
+            .borrow_mut()
+            .entry(q)
+            .or_insert_with(|| self.dependency_tree.borrow_mut().add_node(q))
+            .clone();
+        self.dependency_tree
+            .borrow_mut()
+            .add_edge(q_node_index, dep_node_index, ());
     }
 
     pub fn create_signal<T: Clone + 'static>(&'static self, value: T) -> Signal<T> {
@@ -590,56 +604,267 @@ impl WidgetTree {
         self.draw_index(root, scene, Point::ORIGIN);
     }
 
+    fn current_revision(&'static self) -> Revision {
+        Revision {
+            last_changed: *self.revision.borrow(),
+            valid_through: *self.revision.borrow(),
+        }
+    }
+
     pub fn query_nth_child(&'static self, q: NthChild) -> NodeIndex {
+        self.cache_ratio.borrow_mut().1 += 1;
+
         if let Some(cached_output) = self.nth_child_query_cache.borrow().get(&q) {
-            return *cached_output;
+            if cached_output.revision.valid_through >= *self.revision.borrow() {
+                self.cache_ratio.borrow_mut().0 += 1;
+                return cached_output.value;
+            }
         }
 
-        self.query_stack.borrow_mut().push(QueryDependency::NthChild(q));
+        self.query_stack
+            .borrow_mut()
+            .push(QueryDependency::NthChild(q));
         let output = q.execute(self);
         self.query_stack.borrow_mut().pop().unwrap();
 
-        self.nth_child_query_cache.borrow_mut().insert(q, output);
+        self.nth_child_query_cache.borrow_mut().insert(
+            q,
+            CachedQueryOutput {
+                revision: self.current_revision(),
+                value: output,
+            },
+        );
         output
     }
 
     pub fn query_node_constraints(&'static self, q: NodeIndex) -> Constraints {
+        self.cache_ratio.borrow_mut().1 += 1;
+
         if let Some(cached_output) = self.node_constraints_query_cache.borrow().get(&q) {
-            return *cached_output;
+            if cached_output.revision.valid_through >= *self.revision.borrow() {
+                self.cache_ratio.borrow_mut().0 += 1;
+                return cached_output.value;
+            }
         }
 
-        self.query_stack.borrow_mut().push(QueryDependency::NodeConstraints(q));
+        self.query_stack
+            .borrow_mut()
+            .push(QueryDependency::NodeConstraints(q));
         let output = NodeConstraints { index: q }.execute(self);
         self.query_stack.borrow_mut().pop().unwrap();
 
-        self.node_constraints_query_cache.borrow_mut().insert(q, output);
+        self.node_constraints_query_cache.borrow_mut().insert(
+            q,
+            CachedQueryOutput {
+                revision: self.current_revision(),
+                value: output,
+            },
+        );
         output
     }
 
     pub fn query_node_size(&'static self, q: NodeIndex) -> Size {
+        self.cache_ratio.borrow_mut().1 += 1;
+
         if let Some(cached_output) = self.node_size_query_cache.borrow().get(&q) {
-            return *cached_output;
+            if cached_output.revision.valid_through >= *self.revision.borrow() {
+                self.cache_ratio.borrow_mut().0 += 1;
+                return cached_output.value;
+            }
         }
 
-        self.query_stack.borrow_mut().push(QueryDependency::NodeSize(q));
+        self.query_stack
+            .borrow_mut()
+            .push(QueryDependency::NodeSize(q));
         let output = NodeSize { index: q }.execute(self);
         self.query_stack.borrow_mut().pop().unwrap();
 
-        self.node_size_query_cache.borrow_mut().insert(q, output);
+        self.node_size_query_cache.borrow_mut().insert(
+            q,
+            CachedQueryOutput {
+                revision: self.current_revision(),
+                value: output,
+            },
+        );
         output
     }
 
     pub fn query_node_position(&'static self, q: NodeIndex) -> Point {
+        self.cache_ratio.borrow_mut().1 += 1;
+
         if let Some(cached_output) = self.node_position_query_cache.borrow().get(&q) {
-            return *cached_output;
+            if cached_output.revision.valid_through >= *self.revision.borrow() {
+                self.cache_ratio.borrow_mut().0 += 1;
+                return cached_output.value;
+            }
         }
 
-        self.query_stack.borrow_mut().push(QueryDependency::NodePosition(q));
+        self.query_stack
+            .borrow_mut()
+            .push(QueryDependency::NodePosition(q));
         let output = NodePosition { index: q }.execute(self);
         self.query_stack.borrow_mut().pop().unwrap();
 
-        self.node_position_query_cache.borrow_mut().insert(q, output);
+        self.node_position_query_cache.borrow_mut().insert(
+            q,
+            CachedQueryOutput {
+                revision: self.current_revision(),
+                value: output,
+            },
+        );
         output
+    }
+
+    pub fn invalidate(&'static self, q: QueryDependency) {
+        println!("Invalidating {:?}", q);
+
+        let q_index = self.dependency_node_map.borrow().get(&q).unwrap().clone();
+
+        let q_parents = self
+            .dependency_tree
+            .borrow()
+            .neighbors_directed(q_index, petgraph::Direction::Incoming)
+            .collect::<Vec<_>>();
+
+        let mut to_invalidate = Vec::new();
+
+        for p in q_parents {
+            let p_dep = self
+                .dependency_tree
+                .borrow()
+                .node_weight(p)
+                .unwrap()
+                .clone();
+
+            match p_dep {
+                QueryDependency::NodePosition(node_index) => {
+                    let old_value = self
+                        .node_position_query_cache
+                        .borrow_mut()
+                        .get(&node_index)
+                        .cloned()
+                        .unwrap();
+
+                    let new_value = self.query_node_position(node_index);
+
+                    if new_value == old_value.value {
+                        self.node_position_query_cache.borrow_mut().insert(
+                            node_index,
+                            CachedQueryOutput {
+                                value: new_value,
+                                revision: Revision {
+                                    last_changed: old_value.revision.last_changed,
+                                    valid_through: *self.revision.borrow(),
+                                },
+                            },
+                        );
+                    } else {
+                        to_invalidate.push(p_dep);
+                    }
+                }
+                QueryDependency::NodeConstraints(node_index) => {
+                    let old_value = self
+                        .node_constraints_query_cache
+                        .borrow_mut()
+                        .get(&node_index)
+                        .cloned()
+                        .unwrap();
+
+                    let new_value = self.query_node_constraints(node_index);
+
+                    if new_value == old_value.value {
+                        self.node_constraints_query_cache.borrow_mut().insert(
+                            node_index,
+                            CachedQueryOutput {
+                                value: new_value,
+                                revision: Revision {
+                                    last_changed: old_value.revision.last_changed,
+                                    valid_through: *self.revision.borrow(),
+                                },
+                            },
+                        );
+                    } else {
+                        to_invalidate.push(p_dep);
+                    }
+                }
+                QueryDependency::NodeSize(node_index) => {
+                    let old_value = self
+                        .node_size_query_cache
+                        .borrow_mut()
+                        .get(&node_index)
+                        .cloned()
+                        .unwrap();
+
+                    let new_value = self.query_node_size(node_index);
+
+                    if new_value == old_value.value {
+                        self.node_size_query_cache.borrow_mut().insert(
+                            node_index,
+                            CachedQueryOutput {
+                                value: new_value,
+                                revision: Revision {
+                                    last_changed: old_value.revision.last_changed,
+                                    valid_through: *self.revision.borrow(),
+                                },
+                            },
+                        );
+                    } else {
+                        to_invalidate.push(p_dep);
+                    }
+                }
+                QueryDependency::NthChild(nth_child) => {
+                    let old_value = self
+                        .nth_child_query_cache
+                        .borrow_mut()
+                        .get(&nth_child)
+                        .cloned()
+                        .unwrap();
+
+                    let new_value = self.query_nth_child(nth_child);
+
+                    if new_value == old_value.value {
+                        self.nth_child_query_cache.borrow_mut().insert(
+                            nth_child,
+                            CachedQueryOutput {
+                                value: new_value,
+                                revision: Revision {
+                                    last_changed: old_value.revision.last_changed,
+                                    valid_through: *self.revision.borrow(),
+                                },
+                            },
+                        );
+                    } else {
+                        to_invalidate.push(p_dep);
+                    }
+                }
+                QueryDependency::Signal(_) => {
+                    panic!("A signal should never depend on another thing");
+                }
+            };
+        }
+
+        for dep in to_invalidate {
+            self.invalidate(dep);
+        }
+    }
+
+    pub fn reset(&'static self) {
+        println!("******* Resetting!!");
+
+        println!("==========================");
+        println!("{:?}", self.dependency_tree.borrow());
+        println!("==========================");
+
+        *self.revision.borrow_mut() = 0;
+        *self.cache_ratio.borrow_mut() = (0, 1);
+
+        self.dependency_node_map.borrow_mut().clear();
+        self.dependency_tree.borrow_mut().clear();
+
+        self.node_position_query_cache.borrow_mut().clear();
+        self.node_size_query_cache.borrow_mut().clear();
+        self.node_constraints_query_cache.borrow_mut().clear();
+        self.nth_child_query_cache.borrow_mut().clear();
     }
 }
 
@@ -711,21 +936,14 @@ impl ApplicationHandler for SimpleVelloApp<'_> {
         window_id: winit::window::WindowId,
         event: WindowEvent,
     ) {
-        // Ignore the event (return from the function) if
-        //   - we have no render_state
-        //   - OR the window id of the event doesn't match the window id of our render_state
-        //
-        // Else extract a mutable reference to the render state from its containing option for use below
         let render_state = match &mut self.state {
             RenderState::Active(state) if state.window.id() == window_id => state,
             _ => return,
         };
 
         match event {
-            // Exit the event loop when a close is requested (e.g. window's close button is pressed)
             WindowEvent::CloseRequested => event_loop.exit(),
 
-            // Resize the surface when the window is resized
             WindowEvent::Resized(size) => {
                 self.context
                     .resize_surface(&mut render_state.surface, size.width, size.height);
@@ -733,32 +951,51 @@ impl ApplicationHandler for SimpleVelloApp<'_> {
                     Size::new(size.width as f64, size.height as f64);
             }
 
-            // This is where all the rendering happens
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                ..
+            } => {
+                *self.widget_tree.revision.borrow_mut() += 1;
+                self.widget_tree
+                    .signals
+                    .borrow_mut()
+                    .get_mut(&SignalId(0))
+                    .unwrap()
+                    .downcast_mut::<Size>()
+                    .unwrap()
+                    .width += 10.0;
+                self.widget_tree
+                    .invalidate(QueryDependency::Signal(SignalId(0)));
+            }
+
             WindowEvent::RedrawRequested => {
-                // Empty the scene of objects to draw. You could create a new Scene each time, but in this case
-                // the same Scene is reused so that the underlying memory allocation can also be reused.
+                *self.widget_tree.revision.borrow_mut() += 1;
+                if *self.widget_tree.revision.borrow() > 100 {
+                    self.widget_tree.reset();
+                }
+
+                // println!(
+                //     "Cache ratio: {:?}",
+                //     self.widget_tree.cache_ratio.borrow().0 as f64
+                //         / self.widget_tree.cache_ratio.borrow().1 as f64
+                // );
+
                 self.scene.reset();
 
-                // Get the RenderSurface (surface + config)
                 let surface = &render_state.surface;
 
                 self.widget_tree.draw(&mut self.scene);
-                // println!("===================");
 
-                // Get the window size
                 let width = surface.config.width;
                 let height = surface.config.height;
 
-                // Get a handle to the device
                 let device_handle = &self.context.devices[surface.dev_id];
 
-                // Get the surface's texture
                 let surface_texture = surface
                     .surface
                     .get_current_texture()
                     .expect("failed to get surface texture");
 
-                // Render to the surface's texture
                 self.renderers[surface.dev_id]
                     .as_mut()
                     .unwrap()
@@ -880,7 +1117,6 @@ impl Layouter for SizedBoxLayouter {
 
 // todo(chad):
 // # GENERAL
-// - Signals
 // - Implement cache red/green algorithm
 // - Interactivity (keyboard/mouse events)
 // - Text widget
@@ -903,10 +1139,11 @@ fn main() -> Result<()> {
     let widget_tree = WidgetTree::new();
     let widget_tree = Box::leak(Box::new(widget_tree));
 
-    let dyn_size = widget_tree.create_signal(Size {
+    let size = Size {
         width: 100.0,
         height: 100.0,
-    });
+    };
+    let dyn_size = widget_tree.create_signal(size);
 
     let root = widget_tree.add_node(Box::new(RowLayouter {}), None);
     widget_tree.add_child(
@@ -914,7 +1151,7 @@ fn main() -> Result<()> {
         widget_tree.add_child_return_parent(
             Padded::uniform(15.0),
             (
-                DynamicallySizedBoxLayouter { size: dyn_size },
+                SizedBoxLayouter { size },
                 SimpleQuadDrawer {
                     color: [0.6, 0.5, 0.4],
                 },

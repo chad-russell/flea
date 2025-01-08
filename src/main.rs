@@ -1,6 +1,7 @@
 use anyhow::Result;
 use petgraph::graph::{DiGraph, NodeIndex};
-use std::any::{Any, TypeId};
+use std::any::Any;
+use std::borrow::BorrowMut;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
@@ -40,6 +41,15 @@ struct SimpleVelloApp<'s> {
 struct Constraints {
     min: Size,
     max: Size,
+}
+
+impl Constraints {
+    fn clamp_size(&self, s: Size) -> Size {
+        Size {
+            width: s.width.max(self.min.width).min(self.max.width),
+            height: s.height.max(self.min.height).min(self.max.height),
+        }
+    }
 }
 
 impl std::hash::Hash for Constraints {
@@ -621,6 +631,9 @@ impl WidgetTree {
             }
         }
 
+        //println!("Recomputing {:?}", QueryDependency::NthChild(q));
+
+        self.track_dependency(QueryDependency::NthChild(q));
         self.query_stack
             .borrow_mut()
             .push(QueryDependency::NthChild(q));
@@ -647,6 +660,9 @@ impl WidgetTree {
             }
         }
 
+        //println!("Recomputing {:?}", QueryDependency::NodeConstraints(q));
+
+        self.track_dependency(QueryDependency::NodeConstraints(q));
         self.query_stack
             .borrow_mut()
             .push(QueryDependency::NodeConstraints(q));
@@ -673,6 +689,9 @@ impl WidgetTree {
             }
         }
 
+        //println!("Recomputing {:?}", QueryDependency::NodeSize(q));
+
+        self.track_dependency(QueryDependency::NodeSize(q));
         self.query_stack
             .borrow_mut()
             .push(QueryDependency::NodeSize(q));
@@ -699,6 +718,9 @@ impl WidgetTree {
             }
         }
 
+        //println!("Recomputing {:?}", QueryDependency::NodePosition(q));
+
+        self.track_dependency(QueryDependency::NodePosition(q));
         self.query_stack
             .borrow_mut()
             .push(QueryDependency::NodePosition(q));
@@ -716,8 +738,6 @@ impl WidgetTree {
     }
 
     pub fn invalidate(&'static self, q: QueryDependency) {
-        println!("Invalidating {:?}", q);
-
         let q_index = self.dependency_node_map.borrow().get(&q).unwrap().clone();
 
         let q_parents = self
@@ -956,6 +976,7 @@ impl ApplicationHandler for SimpleVelloApp<'_> {
                 ..
             } => {
                 *self.widget_tree.revision.borrow_mut() += 1;
+
                 self.widget_tree
                     .signals
                     .borrow_mut()
@@ -966,19 +987,25 @@ impl ApplicationHandler for SimpleVelloApp<'_> {
                     .width += 10.0;
                 self.widget_tree
                     .invalidate(QueryDependency::Signal(SignalId(0)));
+
+                let RenderState::Active(state) = &mut self.state else {
+                    return;
+                };
+                state.window.borrow_mut().request_redraw();
+                //println!("========");
             }
 
             WindowEvent::RedrawRequested => {
                 *self.widget_tree.revision.borrow_mut() += 1;
-                if *self.widget_tree.revision.borrow() > 100 {
-                    self.widget_tree.reset();
-                }
+                //if *self.widget_tree.revision.borrow() > 100 {
+                //    self.widget_tree.reset();
+                //}
 
-                // println!(
-                //     "Cache ratio: {:?}",
-                //     self.widget_tree.cache_ratio.borrow().0 as f64
-                //         / self.widget_tree.cache_ratio.borrow().1 as f64
-                // );
+                 println!(
+                     "Cache ratio: {:?}",
+                     self.widget_tree.cache_ratio.borrow().0 as f64
+                         / self.widget_tree.cache_ratio.borrow().1 as f64
+                 );
 
                 self.scene.reset();
 
@@ -1046,6 +1073,59 @@ impl Drawer for SimpleQuadDrawer {
         );
         ctx.scene
             .stroke(&stroke, Affine::IDENTITY, rect_stroke_color, None, &rect);
+    }
+}
+
+struct CenteredLayouter { }
+
+impl Layouter for CenteredLayouter {
+    fn constraints_for_child(
+        &self,
+        _tree: &'static WidgetTree,
+        _index: NodeIndex,
+        ctx: LayouterConstrainChildrenCtx,
+    ) -> Constraints {
+        ctx.self_constraints
+    }
+
+    fn position_for_child(
+        &self,
+        tree: &'static WidgetTree,
+        index: NodeIndex,
+        ctx: LayoutChildWasSizedCtx,
+    ) -> Point {
+        let self_size = tree.query_node_size(index);
+        let child_size = tree.query_node_size(tree.query_nth_child(NthChild {
+            parent_index: index,
+            child_n: ctx.child_n,
+        }));
+        Point::new(
+            (self_size.width - child_size.width) / 2.0,
+            (self_size.height - child_size.height) / 2.0,
+        )
+    }
+
+    fn size_for_self(
+        &self,
+        tree: &'static WidgetTree,
+        index: NodeIndex,
+        ctx: LayouterSizeSelfCtx,
+    ) -> Size {
+        // For a centered layouter, the self size could be the size of its child
+        // or it could be determined differently depending on context or other constraints.
+        // Here, we use the maximum constraints as a default.
+        let child_indices = tree
+            .tree
+            .borrow()
+            .neighbors_directed(index, petgraph::Direction::Outgoing)
+            .collect::<Vec<_>>();
+        if child_indices.is_empty() {
+            return ctx.constraints.max; //Handle case with no children
+        }
+
+        let child_index = child_indices[0];
+        let child_size = tree.query_node_size(child_index);
+        ctx.constraints.clamp_size(child_size)
     }
 }
 
@@ -1146,36 +1226,23 @@ fn main() -> Result<()> {
     let dyn_size = widget_tree.create_signal(size);
 
     let root = widget_tree.add_node(Box::new(RowLayouter {}), None);
-    widget_tree.add_child(
-        root,
-        widget_tree.add_child_return_parent(
-            Padded::uniform(15.0),
-            (
-                SizedBoxLayouter { size },
-                SimpleQuadDrawer {
-                    color: [0.6, 0.5, 0.4],
-                },
+    for _ in 0..3 {
+        widget_tree.add_child(
+            root,
+            widget_tree.add_child_return_parent(
+                DynamicallySizedBoxLayouter { size: dyn_size },
+                widget_tree.add_child_return_parent(
+                    CenteredLayouter{}, 
+                    (
+                        SizedBoxLayouter { size },
+                        SimpleQuadDrawer {
+                            color: [0.6, 0.5, 0.4],
+                        },
+                    ),
+                ),
             ),
-        ),
-    );
-    widget_tree.add_child(
-        root,
-        (
-            DynamicallySizedBoxLayouter { size: dyn_size },
-            SimpleQuadDrawer {
-                color: [0.6, 0.5, 0.4],
-            },
-        ),
-    );
-    widget_tree.add_child(
-        root,
-        (
-            DynamicallySizedBoxLayouter { size: dyn_size },
-            SimpleQuadDrawer {
-                color: [0.6, 0.5, 0.4],
-            },
-        ),
-    );
+        );
+    }
 
     let mut app = SimpleVelloApp {
         context: RenderContext::new(),
